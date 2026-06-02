@@ -1,0 +1,17 @@
+# CCS build outputs
+Debug/
+Release/
+
+# Local CCS metadata
+.metadata/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+*.orig
+*.swp
+
+# Windows metadata
+Thumbs.db
+desktop.ini
