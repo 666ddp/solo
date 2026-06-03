@@ -85,6 +85,17 @@ def append_result(status, score, metrics, params):
         )
 
 
+def format_best_params_text():
+    if best_params is None:
+        return "最佳参数：无"
+
+    lines = [f"最佳得分：{best_score:.2f}", "最佳参数："]
+    for i in range(0, len(PARAM_NAMES), 4):
+        chunk = zip(PARAM_NAMES[i:i + 4], best_params[i:i + 4])
+        lines.append("  " + ", ".join(f"{name}={value:.5g}" for name, value in chunk))
+    return "\n".join(lines)
+
+
 def update_score_plot():
     global score_fig, score_ax
 
@@ -107,8 +118,8 @@ def update_score_plot():
         score_fig, score_ax = plt.subplots(figsize=(10, 5))
 
     score_ax.clear()
-    score_ax.plot(rounds, plot_scores, marker="o", linewidth=1.5, label="Trial score")
-    score_ax.plot(rounds, plot_best, color="goldenrod", linewidth=2.0, label="Best so far")
+    score_ax.plot(rounds, plot_scores, marker="o", linewidth=1.5, label="本轮得分")
+    score_ax.plot(rounds, plot_best, color="goldenrod", linewidth=2.0, label="历史最低得分")
     if len(improved) == len(rounds) and np.any(improved):
         score_ax.scatter(
             rounds[improved],
@@ -118,12 +129,12 @@ def update_score_plot():
             facecolor="yellow",
             edgecolor="goldenrod",
             linewidths=1.5,
-            label="New best",
+            label="刷新最低分",
             zorder=4,
         )
-    score_ax.set_xlabel("Trial")
-    score_ax.set_ylabel("Score")
-    score_ax.set_title("Bayesian Optimization Score History")
+    score_ax.set_xlabel("轮次")
+    score_ax.set_ylabel("目标函数得分")
+    score_ax.set_title("轴1贝叶斯优化得分记录")
     score_ax.grid(True)
     score_ax.legend()
     score_fig.tight_layout()
@@ -415,8 +426,8 @@ if score_history:
         plot_best = np.minimum(plot_best, cap)
 
     plt.figure(figsize=(10, 5))
-    plt.plot(rounds, plot_scores, marker="o", linewidth=1.5, label="Trial score")
-    plt.plot(rounds, plot_best, color="goldenrod", linewidth=2.0, label="Best so far")
+    plt.plot(rounds, plot_scores, marker="o", linewidth=1.5, label="本轮得分")
+    plt.plot(rounds, plot_best, color="goldenrod", linewidth=2.0, label="历史最低得分")
     if len(improved) == len(rounds) and np.any(improved):
         plt.scatter(
             rounds[improved],
@@ -426,12 +437,12 @@ if score_history:
             facecolor="yellow",
             edgecolor="goldenrod",
             linewidths=1.5,
-            label="New best",
+            label="刷新最低分",
             zorder=4,
         )
-    plt.xlabel("Trial")
-    plt.ylabel("Score")
-    plt.title("Bayesian Optimization Score History")
+    plt.xlabel("轮次")
+    plt.ylabel("目标函数得分")
+    plt.title("轴1贝叶斯优化得分记录")
     plt.grid(True)
     plt.legend()
     plt.tight_layout()
@@ -448,11 +459,21 @@ if best_speed_data is not None:
         comments="",
     )
     plt.figure(figsize=(10, 5))
-    plt.plot(t, best_speed_data, label="Speed")
-    plt.axhline(y=TARGET_RPM, color="r", linestyle="--", linewidth=2, label="Target")
-    plt.xlabel("Time (s)")
-    plt.ylabel("Speed (RPM)")
-    plt.title("Best HIL Response")
+    plt.plot(t, best_speed_data, label="轴1转速")
+    plt.axhline(y=TARGET_RPM, color="r", linestyle="--", linewidth=2, label="目标转速")
+    plt.xlabel("时间 (s)")
+    plt.ylabel("转速 (rpm)")
+    plt.title("轴1最佳参数控制下的转速响应")
+    plt.gca().text(
+        0.02,
+        0.98,
+        format_best_params_text(),
+        transform=plt.gca().transAxes,
+        va="top",
+        ha="left",
+        fontsize=8,
+        bbox={"boxstyle": "round,pad=0.35", "facecolor": "white", "edgecolor": "0.55", "alpha": 0.88},
+    )
     plt.grid(True)
     plt.legend()
     plt.tight_layout()

@@ -84,6 +84,16 @@ def append_result(status, score, metrics, params, repeat_scores=None):
         )
 
 
+def format_best_params_text():
+    if best_params is None:
+        return "最佳参数：无"
+
+    param_text = ", ".join(
+        f"{name}={value:.8f}" for name, value in zip(PARAM_NAMES, best_params)
+    )
+    return f"最佳得分：{best_score:.2f}\n最佳参数：{param_text}"
+
+
 def update_score_plot():
     global score_fig, score_ax
 
@@ -106,8 +116,8 @@ def update_score_plot():
         score_fig, score_ax = plt.subplots(figsize=(10, 5))
 
     score_ax.clear()
-    score_ax.plot(rounds, plot_scores, marker="o", linewidth=1.5, label="PI2 trial score")
-    score_ax.plot(rounds, plot_best, color="goldenrod", linewidth=2.0, label="Best so far")
+    score_ax.plot(rounds, plot_scores, marker="o", linewidth=1.5, label="本轮得分")
+    score_ax.plot(rounds, plot_best, color="goldenrod", linewidth=2.0, label="历史最低得分")
     if len(improved) == len(rounds) and np.any(improved):
         score_ax.scatter(
             rounds[improved],
@@ -117,7 +127,7 @@ def update_score_plot():
             facecolor="yellow",
             edgecolor="goldenrod",
             linewidths=1.5,
-            label="New best",
+            label="刷新最低分",
             zorder=4,
         )
     bad_mask = np.asarray([status != "OK" for status in status_history], dtype=bool)
@@ -129,11 +139,11 @@ def update_score_plot():
             s=80,
             linewidths=2.0,
             color="tab:red",
-            label="Partial/failed trial",
+            label="部分成功/失败轮次",
         )
-    score_ax.set_xlabel("Trial")
-    score_ax.set_ylabel("Score")
-    score_ax.set_title("Axis 2 PI Bayesian Optimization Score History")
+    score_ax.set_xlabel("轮次")
+    score_ax.set_ylabel("目标函数得分")
+    score_ax.set_title("轴2 PI 贝叶斯优化得分记录")
     score_ax.grid(True)
     score_ax.legend()
     score_fig.tight_layout()
@@ -467,8 +477,8 @@ if score_history:
         plot_best = np.minimum(plot_best, cap)
 
     plt.figure(figsize=(10, 5))
-    plt.plot(rounds, plot_scores, marker="o", linewidth=1.5, label="PI2 trial score")
-    plt.plot(rounds, plot_best, color="goldenrod", linewidth=2.0, label="Best so far")
+    plt.plot(rounds, plot_scores, marker="o", linewidth=1.5, label="本轮得分")
+    plt.plot(rounds, plot_best, color="goldenrod", linewidth=2.0, label="历史最低得分")
     if len(improved) == len(rounds) and np.any(improved):
         plt.scatter(
             rounds[improved],
@@ -478,12 +488,12 @@ if score_history:
             facecolor="yellow",
             edgecolor="goldenrod",
             linewidths=1.5,
-            label="New best",
+            label="刷新最低分",
             zorder=4,
         )
-    plt.xlabel("Trial")
-    plt.ylabel("Score")
-    plt.title("Axis 2 PI Bayesian Optimization Score History")
+    plt.xlabel("轮次")
+    plt.ylabel("目标函数得分")
+    plt.title("轴2 PI 贝叶斯优化得分记录")
     plt.grid(True)
     plt.legend()
     plt.tight_layout()
@@ -500,13 +510,23 @@ if best_speed_data is not None:
         comments="",
     )
     plt.figure(figsize=(10, 5))
-    plt.plot(t, best_speed_data, label="Best axis-2 PI speed")
-    plt.axhline(TARGET_RPM, color="r", linestyle="--", label="Target")
-    plt.xlabel("Time (s)")
-    plt.ylabel("Speed (rpm)")
+    plt.plot(t, best_speed_data, label="轴2转速")
+    plt.axhline(TARGET_RPM, color="r", linestyle="--", label="目标转速")
+    plt.xlabel("时间 (s)")
+    plt.ylabel("转速 (rpm)")
     plt.grid(True)
     plt.legend()
-    plt.title("Best Axis 2 PI Speed Response")
+    plt.title("轴2最佳 PI 参数控制下的转速响应")
+    plt.gca().text(
+        0.02,
+        0.98,
+        format_best_params_text(),
+        transform=plt.gca().transAxes,
+        va="top",
+        ha="left",
+        fontsize=9,
+        bbox={"boxstyle": "round,pad=0.35", "facecolor": "white", "edgecolor": "0.55", "alpha": 0.88},
+    )
     plt.tight_layout()
     plt.savefig(BEST_SPEED_PLOT_PATH, dpi=150)
     print(f"Best speed data saved to: {BEST_SPEED_CSV_PATH}")
