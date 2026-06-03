@@ -117,6 +117,42 @@ def format_best_params_text():
     return "\n".join(lines)
 
 
+def plot_best_improvements(ax, rounds, plot_best, improved):
+    if len(improved) != len(rounds) or not np.any(improved):
+        return
+
+    improved_rounds = rounds[improved]
+    improved_scores = plot_best[improved]
+    ax.plot(
+        improved_rounds,
+        improved_scores,
+        color="goldenrod",
+        linewidth=2.0,
+        label="历史最低得分",
+    )
+    last_round = improved_rounds[-1]
+    last_score = improved_scores[-1]
+    if last_round < rounds[-1]:
+        ax.plot(
+            [last_round, rounds[-1]],
+            [last_score, last_score],
+            color="goldenrod",
+            linewidth=2.0,
+            label="_nolegend_",
+        )
+    ax.scatter(
+        improved_rounds,
+        improved_scores,
+        marker="o",
+        s=70,
+        facecolor="yellow",
+        edgecolor="goldenrod",
+        linewidths=1.5,
+        label="刷新最低分",
+        zorder=4,
+    )
+
+
 def update_score_plot():
     global score_fig, score_ax
 
@@ -140,19 +176,7 @@ def update_score_plot():
 
     score_ax.clear()
     score_ax.plot(rounds, plot_scores, marker="o", linewidth=1.5, label="本轮得分")
-    score_ax.plot(rounds, plot_best, color="goldenrod", linewidth=2.0, label="历史最低得分")
-    if len(improved) == len(rounds) and np.any(improved):
-        score_ax.scatter(
-            rounds[improved],
-            plot_best[improved],
-            marker="o",
-            s=70,
-            facecolor="yellow",
-            edgecolor="goldenrod",
-            linewidths=1.5,
-            label="刷新最低分",
-            zorder=4,
-        )
+    plot_best_improvements(score_ax, rounds, plot_best, improved)
     score_ax.set_xlabel("轮次")
     score_ax.set_ylabel("目标函数得分")
     score_ax.set_title("轴1贝叶斯优化得分记录")
@@ -447,20 +471,9 @@ if score_history:
         plot_best = np.minimum(plot_best, cap)
 
     plt.figure(figsize=(10, 5))
-    plt.plot(rounds, plot_scores, marker="o", linewidth=1.5, label="本轮得分")
-    plt.plot(rounds, plot_best, color="goldenrod", linewidth=2.0, label="历史最低得分")
-    if len(improved) == len(rounds) and np.any(improved):
-        plt.scatter(
-            rounds[improved],
-            plot_best[improved],
-            marker="o",
-            s=70,
-            facecolor="yellow",
-            edgecolor="goldenrod",
-            linewidths=1.5,
-            label="刷新最低分",
-            zorder=4,
-        )
+    ax = plt.gca()
+    ax.plot(rounds, plot_scores, marker="o", linewidth=1.5, label="本轮得分")
+    plot_best_improvements(ax, rounds, plot_best, improved)
     plt.xlabel("轮次")
     plt.ylabel("目标函数得分")
     plt.title("轴1贝叶斯优化得分记录")
