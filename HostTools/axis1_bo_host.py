@@ -2,11 +2,32 @@
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+from matplotlib import font_manager
 import numpy as np
 import serial
 from skopt import gp_minimize
 from skopt.space import Real
 
+
+def setup_chinese_font():
+    font_candidates = [
+        Path(r"C:\Windows\Fonts\msyh.ttc"),
+        Path(r"C:\Windows\Fonts\simhei.ttf"),
+        Path(r"C:\Windows\Fonts\simsun.ttc"),
+    ]
+    for font_path in font_candidates:
+        if font_path.exists():
+            font_manager.fontManager.addfont(str(font_path))
+            font_name = font_manager.FontProperties(fname=str(font_path)).get_name()
+            plt.rcParams["font.sans-serif"] = [font_name, "DejaVu Sans"]
+            plt.rcParams["font.family"] = "sans-serif"
+            plt.rcParams["axes.unicode_minus"] = False
+            return font_name
+    plt.rcParams["axes.unicode_minus"] = False
+    return None
+
+
+CHINESE_FONT_NAME = setup_chinese_font()
 
 DSP_PORT = "COM3"
 BAUD_RATE = 115200
