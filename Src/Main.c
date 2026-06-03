@@ -47,10 +47,18 @@ float32 C3  = 10.0f;
 float32 TC3 = 0.02f;
 float32 C8  = 50.0f;
 // ================= HIL 贝叶斯优化全局变量 =================
-#define RECORD_LENGTH 2000
-float32 Log_Speed[RECORD_LENGTH];
-int16 Log_Speed_2_x10[RECORD_LENGTH];
+#define BO_RECORD_LENGTH 2000
+#define STEP_RECORD_LENGTH 4000
+#define RECORD_LENGTH STEP_RECORD_LENGTH
+#define DUAL_RECORD_LENGTH BO_RECORD_LENGTH
+#define STEP1_END_INDEX 1000
+#define STEP2_END_INDEX 2500
+#define HIL_STEP_SPEED_REF_40 (0.0133333f)
+int16 Log_Speed_x10[RECORD_LENGTH];
+int16 Log_Speed_2_x10[DUAL_RECORD_LENGTH];
 Uint16 Record_Index = 0;           // 记录索引
+Uint16 HIL_RecordLength = BO_RECORD_LENGTH;
+Uint16 HIL_StepMode = 0;
 char Rx_Buffer[192];
 Uint16 Rx_Index = 0;
 Uint16 Rx_LineReady = 0;  // ISR置1表示收到完整行
@@ -73,6 +81,8 @@ float32 HIL_ForceIqPu = 0.0f;
 Uint16 HIL_Speed2SpikeCount = 0;
 
 #define HIL_TARGET_SPEED_REF (0.0267f)
+#define HIL_LOG_MAX_X10 32767
+#define HIL_LOG_MIN_X10 (-32768)
 #define HIL_BOOST_IQ_PU_LOW  (0.15f)
 #define HIL_BOOST_IQ_PU_HIGH (0.20f)
 #define HIL_BOOST_TICKS      (500)
@@ -112,6 +122,21 @@ void Init_SiShu(void);
 void TX232_String(char *str);
 void HIL_Evaluation_Task(void);
 void HIL_Poll_Rx(void);
+float32 HIL_StepSpeedRef(Uint16 index);
+
+static int16 HIL_SpeedRpmToX10(float32 speed_rpm)
+{
+    float32 scaled = speed_rpm * 10.0f;
+    if(scaled > (float32)HIL_LOG_MAX_X10)
+    {
+        return HIL_LOG_MAX_X10;
+    }
+    if(scaled < (float32)HIL_LOG_MIN_X10)
+    {
+        return HIL_LOG_MIN_X10;
+    }
+    return (int16)scaled;
+}
 
 //*****************************************************************************************************
 //全局变量定义与初始化
@@ -706,6 +731,10 @@ if(Run_PMSM==1&&IPM_Fault==0)//初始位置定位算法
 
                     // --- 量纲转换模块 ---
                     float32 actual_speed_rpm = _IQtoF(Speed) * (float32)BaseSpeed; // 现在 Speed 有真实数据了
+                    if(Eval_State == 2 && HIL_StepMode != 0)
+                    {
+                        SpeedRef = HIL_StepSpeedRef(Record_Index);
+                    }
                     float32 target_speed_rpm = SpeedRef * (float32)BaseSpeed;
                     float32 speed_abs_rpm;
                     float32 speed_limit_rpm = 1.2f * (float32)BaseSpeed;
@@ -758,9 +787,9 @@ if(Run_PMSM==1&&IPM_Fault==0)//初始位置定位算法
 
                       if(HIL_FailCode == 0)
                         {
-                        if(Record_Index < RECORD_LENGTH)
+                        if(Record_Index < HIL_RecordLength)
                           {
-                          Log_Speed[Record_Index] = actual_speed_rpm;
+                          Log_Speed_x10[Record_Index] = HIL_SpeedRpmToX10(actual_speed_rpm);
                           Record_Index++;
                           }
                          else
@@ -773,21 +802,10 @@ if(Run_PMSM==1&&IPM_Fault==0)//初始位置定位算法
                       {
                       if(HIL_FailCode == 0)
                         {
-                        if(Record_Index < RECORD_LENGTH)
+                        if(Record_Index < HIL_RecordLength)
                           {
-                          Log_Speed[Record_Index] = actual_speed_rpm;
-                          if(Log_Spd2 > 3276.7f)
-                            {
-                            Log_Speed_2_x10[Record_Index] = 32767;
-                            }
-                          else if(Log_Spd2 < -3276.8f)
-                            {
-                            Log_Speed_2_x10[Record_Index] = -32768;
-                            }
-                          else
-                            {
-                            Log_Speed_2_x10[Record_Index] = (int16)(Log_Spd2 * 10.0f);
-                            }
+                          Log_Speed_x10[Record_Index] = HIL_SpeedRpmToX10(actual_speed_rpm);
+                          Log_Speed_2_x10[Record_Index] = HIL_SpeedRpmToX10(Log_Spd2);
                           Record_Index++;
                           }
                          else
@@ -1339,9 +1357,9 @@ if(axis2_delta_rpm < 0.0f) axis2_delta_rpm = -axis2_delta_rpm;
 
                 if(HIL_FailCode == 0)
                 {
-                    if(Record_Index < RECORD_LENGTH)
+                    if(Record_Index < HIL_RecordLength)
                     {
-                        Log_Speed[Record_Index] = axis2_speed_rpm;
+                        Log_Speed_x10[Record_Index] = HIL_SpeedRpmToX10(axis2_speed_rpm);
                         Record_Index++;
                     }
                     else
@@ -1383,6 +1401,10 @@ if(axis2_delta_rpm < 0.0f) axis2_delta_rpm = -axis2_delta_rpm;
 
     }
   //=================速度环PI===================================
+            if(Eval_State == 22 && HIL_StepMode != 0)
+            {
+                SpeedRef_2 = HIL_StepSpeedRef(Record_Index);
+            }
             if(Eval_State == 31 || Eval_State == 22)
             {
                 Speed_2Ref=_IQ(SpeedRef_2);
@@ -1692,6 +1714,7 @@ void HIL_Poll_Rx(void)
     Uint16 i;
     Uint16 j;
     Uint16 s;
+    Uint16 parse_start;
     float32 frac;
     Uint16 has_dot;
 
@@ -1705,7 +1728,9 @@ void HIL_Poll_Rx(void)
             {
                 Rx_Buffer[Rx_Index] = '\0';
 
-                if(Rx_Buffer[0] == 'P' && Rx_Buffer[1] == ',')
+                if((Rx_Buffer[0] == 'P' && Rx_Buffer[1] == ',') ||
+                   (Rx_Buffer[0] == 'S' && Rx_Buffer[1] == 'T' && Rx_Buffer[2] == 'E' &&
+                    Rx_Buffer[3] == 'P' && Rx_Buffer[4] == '1' && Rx_Buffer[5] == ','))
                 {
                     if(Eval_State != 0)
                     {
@@ -1713,8 +1738,10 @@ void HIL_Poll_Rx(void)
                     }
                     else
                     {
+                        parse_start = 2;
+                        if(Rx_Buffer[0] == 'S') parse_start = 6;
                         seg = 0; ti = 0;
-                        for(i = 2; i < 192; i++)
+                        for(i = parse_start; i < 192; i++)
                         {
                             if(Rx_Buffer[i] == ',' || Rx_Buffer[i] == '\0')
                             {
@@ -1746,6 +1773,7 @@ void HIL_Poll_Rx(void)
                             if(p[8]  > 0.001f && p[8]  < 2000.0f)  A33 = p[8];
                             if(p[9]  > 0.001f && p[9]  < 2000.0f)  B33 = p[9];
                             if(p[10] > 0.1f   && p[10] < 2000.0f)  C8  = p[10];
+                            HIL_StepMode = (parse_start == 6) ? 1 : 0;
                             New_Params_Flag = 1;
                         }
                     }
@@ -1798,8 +1826,10 @@ void HIL_Poll_Rx(void)
                         }
                     }
                 }
-                else if(Rx_Buffer[0] == 'P' && Rx_Buffer[1] == 'I' && Rx_Buffer[2] == '2' &&
-                        Rx_Buffer[3] == ',')
+                else if((Rx_Buffer[0] == 'P' && Rx_Buffer[1] == 'I' && Rx_Buffer[2] == '2' &&
+                         Rx_Buffer[3] == ',') ||
+                        (Rx_Buffer[0] == 'S' && Rx_Buffer[1] == 'T' && Rx_Buffer[2] == 'E' &&
+                         Rx_Buffer[3] == 'P' && Rx_Buffer[4] == '2' && Rx_Buffer[5] == ','))
                 {
                     if(Eval_State != 0)
                     {
@@ -1807,8 +1837,10 @@ void HIL_Poll_Rx(void)
                     }
                     else
                     {
+                        parse_start = 4;
+                        if(Rx_Buffer[0] == 'S') parse_start = 6;
                         seg = 0; ti = 0;
-                        for(i = 4; i < 192; i++)
+                        for(i = parse_start; i < 192; i++)
                         {
                             if(Rx_Buffer[i] == ',' || Rx_Buffer[i] == '\0')
                             {
@@ -1831,6 +1863,7 @@ void HIL_Poll_Rx(void)
                         {
                             if(p[0] > 0.001f && p[0] < 200.0f) Speed_2Kp = _IQ(p[0]);
                             if(p[1] > 0.000001f && p[1] < 1.0f) Speed_2Ki = _IQ(p[1]);
+                            HIL_StepMode = (parse_start == 6) ? 1 : 0;
                             New_PI2_Params_Flag = 1;
                         }
                     }
@@ -1896,6 +1929,20 @@ PieCtrlRegs.PIEACK.all = PIEACK_GROUP12;//清除第十二组的中断标志
 }
 
 
+float32 HIL_StepSpeedRef(Uint16 index)
+{
+    if(index < STEP1_END_INDEX)
+    {
+        return 0.0f;
+    }
+    if(index < STEP2_END_INDEX)
+    {
+        return HIL_STEP_SPEED_REF_40;
+    }
+    return HIL_TARGET_SPEED_REF;
+}
+
+
 void HIL_Evaluation_Task(void)
 {
     HIL_Poll_Rx();
@@ -1913,6 +1960,8 @@ void HIL_Evaluation_Task(void)
         New_PI2_Params_Flag = 0;
         New_Dual_Params_Flag = 0;
         Eval_State = 0;
+        HIL_RecordLength = BO_RECORD_LENGTH;
+        HIL_StepMode = 0;
         HIL_BoostDelay = 0;
         HIL_ForceIq = 0;
         HIL_ForceIqPu = 0.0f;
@@ -1941,6 +1990,7 @@ void HIL_Evaluation_Task(void)
     if(New_Params_Flag == 1 && Eval_State == 0)
     {
         New_Params_Flag = 0;
+        HIL_RecordLength = (HIL_StepMode != 0) ? STEP_RECORD_LENGTH : BO_RECORD_LENGTH;
         HIL_BoostDelay = 0;
         HIL_ForceIq = 0;
         HIL_ForceIqPu = 0.0f;
@@ -1958,6 +2008,7 @@ void HIL_Evaluation_Task(void)
     if(New_PI2_Params_Flag == 1 && Eval_State == 0)
     {
         New_PI2_Params_Flag = 0;
+        HIL_RecordLength = (HIL_StepMode != 0) ? STEP_RECORD_LENGTH : BO_RECORD_LENGTH;
         HIL_BoostDelay = 0;
         HIL_ForceIq = 0;
         HIL_ForceIqPu = 0.0f;
@@ -2016,6 +2067,8 @@ void HIL_Evaluation_Task(void)
     if(New_Dual_Params_Flag == 1 && Eval_State == 0)
     {
         New_Dual_Params_Flag = 0;
+        HIL_RecordLength = BO_RECORD_LENGTH;
+        HIL_StepMode = 0;
         HIL_BoostDelay = 0;
         HIL_ForceIq = 0;
         HIL_ForceIqPu = 0.0f;
@@ -2259,13 +2312,13 @@ if(U_dc_dis <= 15)
         TX232_String("DUAL_START\n");
 
         DINT;
-        for(i = 0; i < RECORD_LENGTH; i++)
+        for(i = 0; i < HIL_RecordLength; i++)
         {
             float32 vals[2];
             Uint16 kk;
             Uint16 idx = 0;
 
-            vals[0] = Log_Speed[i];
+            vals[0] = ((float32)Log_Speed_x10[i]) * 0.1f;
             vals[1] = ((float32)Log_Speed_2_x10[i]) * 0.1f;
 
             for(kk = 0; kk < 2; kk++)
@@ -2322,9 +2375,9 @@ if(U_dc_dis <= 15)
         TX232_String("DATA_START\n");
 
         DINT;
-        for(i = 0; i < RECORD_LENGTH; i++)
+        for(i = 0; i < HIL_RecordLength; i++)
         {
-            float32 val = Log_Speed[i];
+            float32 val = ((float32)Log_Speed_x10[i]) * 0.1f;
             Uint16 int_part, frac_part, idx = 0;
 
             if(val != val) { val = 0.0f; }
