@@ -539,12 +539,12 @@ if best_speed_data is not None:
     plt.legend()
     plt.title("轴2最佳 PI 参数控制下的转速响应")
     plt.gca().text(
-        0.02,
         0.98,
+        0.02,
         format_best_params_text(),
         transform=plt.gca().transAxes,
-        va="top",
-        ha="left",
+        va="bottom",
+        ha="right",
         fontsize=9,
         bbox={"boxstyle": "round,pad=0.35", "facecolor": "white", "edgecolor": "0.55", "alpha": 0.88},
     )
