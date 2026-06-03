@@ -1,0 +1,513 @@
+﻿import time
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import serial
+from skopt import gp_minimize
+from skopt.space import Real
+
+
+DSP_PORT = "COM3"
+BAUD_RATE = 115200
+TARGET_RPM = 80.0
+RECORD_LENGTH = 2000
+DT = 0.001
+COOLDOWN = 10.0
+N_CALLS = 40
+N_INITIAL_POINTS = 15
+REPEATS_PER_POINT = 1
+
+FAIL_SCORE = 200000.0
+ACK_TIMEOUT = 6.0
+DATA_TIMEOUT = 15.0
+POST_DATA_READY_TIMEOUT = 3.0
+MAX_ACK_ATTEMPTS = 6
+PRE_SEND_QUIET = 1.5
+
+MIN_VALID_RPM = TARGET_RPM * 0.75
+TAIL_FRACTION = 0.50
+STARTUP_IGNORE_TIME = 0.10
+RISE_FRACTION = 0.90
+SETTLING_BAND = 0.08
+SMOOTHING_WINDOW = 25
+SPIKE_MAX_ABS_RPM = 300.0
+SPIKE_MAX_STEP_RPM = 150.0
+
+PARAM_NAMES = ("Kp", "Ki")
+RUN_TIMESTAMP = time.strftime("%Y%m%d_%H%M%S")
+RESULT_DIR = Path(__file__).with_name("axis2_bo_results")
+RESULT_DIR.mkdir(exist_ok=True)
+LOG_PATH = RESULT_DIR / f"axis2_bo_pi2_results_{RUN_TIMESTAMP}.csv"
+SCORE_PLOT_PATH = RESULT_DIR / f"axis2_bo_pi2_score_history_{RUN_TIMESTAMP}.png"
+BEST_SPEED_CSV_PATH = RESULT_DIR / f"axis2_best_speed_2000pts_{RUN_TIMESTAMP}.csv"
+BEST_SPEED_PLOT_PATH = RESULT_DIR / f"axis2_best_speed_waveform_{RUN_TIMESTAMP}.png"
+LIVE_SCORE_PLOT = True
+
+
+try:
+    ser = serial.Serial(DSP_PORT, BAUD_RATE, timeout=0.05)
+    print(f"Connected to DSP serial port: {DSP_PORT}")
+except Exception as exc:
+    print(f"Failed to open serial port: {exc}")
+    raise SystemExit(1)
+
+
+best_speed_data = None
+best_params = None
+best_score = float("inf")
+score_history = []
+best_score_history = []
+best_improved_history = []
+status_history = []
+score_fig = None
+score_ax = None
+trial_count = 0
+
+LOG_PATH.write_text(
+    "trial,status,score,rise_time,settling_time,overshoot,tail_mean,tail_max,repeat_scores,"
+    + ",".join(PARAM_NAMES)
+    + "\n",
+    encoding="utf-8",
+)
+
+
+def append_result(status, score, metrics, params, repeat_scores=None):
+    with LOG_PATH.open("a", encoding="utf-8") as fp:
+        param_text = ",".join(f"{value:.8f}" for value in params)
+        repeat_text = "|".join(f"{value:.6f}" for value in (repeat_scores or []))
+        fp.write(
+            f"{trial_count},{status},{score:.6f},"
+            f"{metrics['rise_time']:.6f},{metrics['settling_time']:.6f},"
+            f"{metrics['overshoot']:.6f},{metrics['tail_mean']:.6f},"
+            f"{metrics['tail_max']:.6f},{repeat_text},{param_text}\n"
+        )
+
+
+def update_score_plot():
+    global score_fig, score_ax
+
+    if not LIVE_SCORE_PLOT or not score_history:
+        return
+
+    rounds = np.arange(1, len(score_history) + 1)
+    plot_scores = np.asarray(score_history, dtype=float)
+    plot_best = np.asarray(best_score_history, dtype=float)
+    improved = np.asarray(best_improved_history, dtype=bool)
+
+    finite_good = plot_scores[plot_scores < FAIL_SCORE]
+    if len(finite_good) > 0:
+        cap = max(float(np.max(finite_good)) * 1.15, float(np.min(finite_good)) + 1.0)
+        plot_scores = np.minimum(plot_scores, cap)
+        plot_best = np.minimum(plot_best, cap)
+
+    if score_fig is None or score_ax is None:
+        plt.ion()
+        score_fig, score_ax = plt.subplots(figsize=(10, 5))
+
+    score_ax.clear()
+    score_ax.plot(rounds, plot_scores, marker="o", linewidth=1.5, label="PI2 trial score")
+    score_ax.plot(rounds, plot_best, color="goldenrod", linewidth=2.0, label="Best so far")
+    if len(improved) == len(rounds) and np.any(improved):
+        score_ax.scatter(
+            rounds[improved],
+            plot_best[improved],
+            marker="o",
+            s=70,
+            facecolor="yellow",
+            edgecolor="goldenrod",
+            linewidths=1.5,
+            label="New best",
+            zorder=4,
+        )
+    bad_mask = np.asarray([status != "OK" for status in status_history], dtype=bool)
+    if len(bad_mask) == len(rounds) and np.any(bad_mask):
+        score_ax.scatter(
+            rounds[bad_mask],
+            plot_scores[bad_mask],
+            marker="x",
+            s=80,
+            linewidths=2.0,
+            color="tab:red",
+            label="Partial/failed trial",
+        )
+    score_ax.set_xlabel("Trial")
+    score_ax.set_ylabel("Score")
+    score_ax.set_title("Axis 2 PI Bayesian Optimization Score History")
+    score_ax.grid(True)
+    score_ax.legend()
+    score_fig.tight_layout()
+    score_fig.savefig(SCORE_PLOT_PATH, dpi=150)
+    plt.pause(0.01)
+
+
+
+def read_line_until(deadline):
+    while time.time() < deadline:
+        raw = ser.readline()
+        if not raw:
+            continue
+        line = raw.decode("utf-8", errors="ignore").strip()
+        if line:
+            return line
+    return None
+
+
+def wait_for_ack(cmd):
+    time.sleep(PRE_SEND_QUIET)
+    attempt = 0
+    while True:
+        attempt += 1
+        if attempt == 1:
+            ser.reset_input_buffer()
+        ser.write(cmd.encode("utf-8"))
+        ser.flush()
+
+        deadline = time.time() + ACK_TIMEOUT
+        while time.time() < deadline:
+            line = read_line_until(deadline)
+            if line is None:
+                break
+            if line == "AK":
+                return True
+            if line in {"RUN_FAIL", "NO_DC", "HALL_FAIL", "STALL", "DC_DROP"}:
+                print(f"   DSP fault before run: {line}")
+                return False
+            if line == "BUSY":
+                print("   DSP busy, retry after cooldown")
+                time.sleep(COOLDOWN)
+                break
+            if line == "READY":
+                continue
+
+        print(f"   No ACK, retry {attempt} until ACK")
+        time.sleep(0.5)
+
+
+def wait_for_ready_after_data():
+    deadline = time.time() + POST_DATA_READY_TIMEOUT
+    while time.time() < deadline:
+        line = read_line_until(deadline)
+        if line is None:
+            break
+        if line == "READY":
+            return True
+        if line in {"RUN_FAIL", "NO_DC", "HALL_FAIL", "STALL", "DC_DROP"}:
+            print(f"   DSP fault after data: {line}")
+            return False
+
+    print("   DATA_END received, but READY was not seen")
+    return False
+
+
+def receive_speed_data():
+    speed_data = []
+    saw_data_end = False
+    deadline = time.time() + DATA_TIMEOUT
+
+    while time.time() < deadline:
+        line = read_line_until(deadline)
+        if line is None:
+            break
+        if line == "DATA_START":
+            break
+        if line in {"RUN_FAIL", "NO_DC", "HALL_FAIL", "STALL", "DC_DROP"}:
+            print(f"   DSP fault: {line}")
+            return None
+    else:
+        return None
+
+    deadline = time.time() + DATA_TIMEOUT
+    while time.time() < deadline:
+        line = read_line_until(deadline)
+        if line is None:
+            break
+        if line == "DATA_END":
+            saw_data_end = True
+            break
+        try:
+            if len(speed_data) < RECORD_LENGTH:
+                speed_data.append(float(line))
+        except ValueError:
+            continue
+
+    if saw_data_end:
+        wait_for_ready_after_data()
+
+    if not speed_data:
+        return None
+
+    if len(speed_data) < RECORD_LENGTH:
+        speed_data.extend([speed_data[-1]] * (RECORD_LENGTH - len(speed_data)))
+
+    return np.asarray(speed_data[:RECORD_LENGTH], dtype=float)
+
+
+def remove_speed_spikes(speed_array):
+    clean = np.asarray(speed_array, dtype=float).copy()
+    if len(clean) == 0:
+        return clean
+
+    last = clean[0]
+    for i in range(1, len(clean)):
+        value = clean[i]
+        if (
+            not np.isfinite(value)
+            or abs(value) > SPIKE_MAX_ABS_RPM
+            or abs(value - last) > SPIKE_MAX_STEP_RPM
+        ):
+            clean[i] = last
+        else:
+            last = value
+    return clean
+
+
+def calculate_score(speed_array):
+    speed_array = remove_speed_spikes(speed_array)
+    speed_abs = np.abs(speed_array)
+    if SMOOTHING_WINDOW > 1 and len(speed_abs) >= SMOOTHING_WINDOW:
+        kernel = np.ones(SMOOTHING_WINDOW, dtype=float) / SMOOTHING_WINDOW
+        pad_left = SMOOTHING_WINDOW // 2
+        pad_right = SMOOTHING_WINDOW - 1 - pad_left
+        padded = np.pad(speed_abs, (pad_left, pad_right), mode="edge")
+        speed_abs = np.convolve(padded, kernel, mode="valid")
+
+    ignore_count = min(int(STARTUP_IGNORE_TIME / DT), len(speed_abs) - 1)
+    response = speed_abs[ignore_count:]
+    start = int(len(response) * (1.0 - TAIL_FRACTION))
+    eval_data = response[start:]
+
+    tail_mean = float(np.mean(eval_data))
+    tail_max = float(np.max(eval_data))
+    overshoot = max(0.0, float(np.max(response) - TARGET_RPM))
+
+    metrics = {
+        "rise_time": DT * len(response),
+        "settling_time": DT * len(response),
+        "overshoot": overshoot,
+        "tail_mean": tail_mean,
+        "tail_max": tail_max,
+    }
+
+    if tail_mean < MIN_VALID_RPM:
+        return FAIL_SCORE, metrics
+
+    rise_indices = np.flatnonzero(response >= TARGET_RPM * RISE_FRACTION)
+    if len(rise_indices) > 0:
+        metrics["rise_time"] = float(rise_indices[0] * DT)
+
+    band = TARGET_RPM * SETTLING_BAND
+    outside = np.flatnonzero(np.abs(response - TARGET_RPM) > band)
+    if len(outside) == 0:
+        metrics["settling_time"] = 0.0
+    elif outside[-1] < len(response) - 1:
+        metrics["settling_time"] = float((outside[-1] + 1) * DT)
+
+    t = np.arange(len(eval_data), dtype=float) * DT
+    error = np.abs(TARGET_RPM - eval_data)
+    steady_itae = float(np.sum(t * error))
+    steady_error = abs(TARGET_RPM - tail_mean)
+    ripple = float(np.std(eval_data))
+
+    return (
+        metrics["rise_time"] * 4000.0
+        + metrics["settling_time"] * 1800.0
+        + overshoot * 100.0
+        + steady_error * 50.0
+        + ripple * 8.0
+        + steady_itae * 0.5
+    ), metrics
+
+
+def run_single_repeat(params, repeat_index):
+    kp, ki = params
+    cmd = f"PI2,{kp:.6g},{ki:.6g}\n"
+    score = FAIL_SCORE
+    status = "ACK_FAIL"
+    metrics = {
+        "rise_time": 0.0,
+        "settling_time": 0.0,
+        "overshoot": 0.0,
+        "tail_mean": 0.0,
+        "tail_max": 0.0,
+    }
+
+    print(f"   Repeat {repeat_index}/{REPEATS_PER_POINT}")
+    if wait_for_ack(cmd):
+        print("   ACK received, waiting for axis-2 data...")
+        speed_data = receive_speed_data()
+        if speed_data is None:
+            print("   No valid speed data")
+            status = "NO_DATA"
+        else:
+            score, metrics = calculate_score(speed_data)
+            status = "OK" if score < FAIL_SCORE else "LOW_SPEED"
+            print(
+                f"   Done. score={score:.1f}, "
+                f"rise={metrics['rise_time']:.3f}s, "
+                f"settle={metrics['settling_time']:.3f}s, "
+                f"overshoot={metrics['overshoot']:.1f} rpm, "
+                f"tail_mean={metrics['tail_mean']:.1f} rpm"
+            )
+            return status, score, metrics, speed_data
+    else:
+        print("   ACK failed")
+
+    return status, score, metrics, None
+
+
+def average_metrics(metrics_list):
+    return {
+        key: float(np.mean([metrics[key] for metrics in metrics_list]))
+        for key in metrics_list[0]
+    }
+
+
+def run_axis2_pi_experiment(params):
+    global best_speed_data, best_params, best_score, trial_count
+    trial_count += 1
+
+    kp, ki = params
+    print(f"\n[PI2 Trial {trial_count}/{N_CALLS}] Kp:{kp:.5g}, Ki:{ki:.6g}")
+
+    ok_scores = []
+    ok_metrics = []
+    ok_speed_data = []
+    repeat_scores = []
+    statuses = []
+    improved_best = False
+
+    for repeat_index in range(1, REPEATS_PER_POINT + 1):
+        status, score, metrics, speed_data = run_single_repeat(params, repeat_index)
+        repeat_scores.append(score)
+        statuses.append(status)
+        if status == "OK" and score < FAIL_SCORE:
+            ok_scores.append(score)
+            ok_metrics.append(metrics)
+            ok_speed_data.append(speed_data)
+
+        if repeat_index < REPEATS_PER_POINT:
+            print(f"   Repeat cooldown {COOLDOWN:.0f}s")
+            time.sleep(COOLDOWN)
+
+    if ok_scores:
+        score = float(np.mean(ok_scores))
+        metrics = average_metrics(ok_metrics)
+        status = "OK" if len(ok_scores) == REPEATS_PER_POINT else "PARTIAL_OK"
+        best_repeat = int(np.argmin(ok_scores))
+        representative_speed = ok_speed_data[best_repeat]
+    else:
+        score = FAIL_SCORE
+        metrics = {
+            "rise_time": 0.0,
+            "settling_time": 0.0,
+            "overshoot": 0.0,
+            "tail_mean": 0.0,
+            "tail_max": 0.0,
+        }
+        status = statuses[-1] if statuses else "FAIL"
+        representative_speed = None
+
+    print(
+        f"   Trial average. status={status}, score={score:.1f}, "
+        f"valid_repeats={len(ok_scores)}/{REPEATS_PER_POINT}"
+    )
+
+    if score < best_score:
+        best_score = score
+        best_params = tuple(params)
+        if representative_speed is not None:
+            best_speed_data = representative_speed.copy()
+        improved_best = True
+        print(f"   New best PI2 average score: {best_score:.1f}")
+
+    append_result(status, score, metrics, params, repeat_scores)
+    score_history.append(score)
+    best_score_history.append(min(score_history))
+    best_improved_history.append(improved_best)
+    status_history.append(status)
+    update_score_plot()
+    print(f"   Cooldown {COOLDOWN:.0f}s")
+    time.sleep(COOLDOWN)
+    return score
+
+
+space = [
+    Real(6.0, 10.0, name="Kp"),
+    Real(0.003, 0.008, name="Ki"),
+]
+
+print("=====================================================")
+print("Starting axis-2 PI HIL Bayesian optimization")
+print("=====================================================")
+
+res = gp_minimize(
+    run_axis2_pi_experiment,
+    space,
+    n_calls=N_CALLS,
+    n_initial_points=N_INITIAL_POINTS,
+    acq_func="EI",
+    random_state=42,
+)
+
+print("\nAxis-2 PI optimization complete")
+print(f"Best score: {res.fun:.2f}")
+print(f"Best PI2 params: Kp={res.x[0]:.8f}, Ki={res.x[1]:.8f}")
+
+if score_history:
+    rounds = np.arange(1, len(score_history) + 1)
+    plot_scores = np.asarray(score_history, dtype=float)
+    plot_best = np.asarray(best_score_history, dtype=float)
+    improved = np.asarray(best_improved_history, dtype=bool)
+
+    finite_good = plot_scores[plot_scores < FAIL_SCORE]
+    if len(finite_good) > 0:
+        cap = max(float(np.max(finite_good)) * 1.15, float(np.min(finite_good)) + 1.0)
+        plot_scores = np.minimum(plot_scores, cap)
+        plot_best = np.minimum(plot_best, cap)
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(rounds, plot_scores, marker="o", linewidth=1.5, label="PI2 trial score")
+    plt.plot(rounds, plot_best, color="goldenrod", linewidth=2.0, label="Best so far")
+    if len(improved) == len(rounds) and np.any(improved):
+        plt.scatter(
+            rounds[improved],
+            plot_best[improved],
+            marker="o",
+            s=70,
+            facecolor="yellow",
+            edgecolor="goldenrod",
+            linewidths=1.5,
+            label="New best",
+            zorder=4,
+        )
+    plt.xlabel("Trial")
+    plt.ylabel("Score")
+    plt.title("Axis 2 PI Bayesian Optimization Score History")
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(SCORE_PLOT_PATH, dpi=150)
+    print(f"Score history plot saved to: {SCORE_PLOT_PATH}")
+
+if best_speed_data is not None:
+    t = np.arange(len(best_speed_data)) * DT
+    np.savetxt(
+        BEST_SPEED_CSV_PATH,
+        np.column_stack((t, best_speed_data)),
+        delimiter=",",
+        header="time_s,best_axis2_speed_rpm",
+        comments="",
+    )
+    plt.figure(figsize=(10, 5))
+    plt.plot(t, best_speed_data, label="Best axis-2 PI speed")
+    plt.axhline(TARGET_RPM, color="r", linestyle="--", label="Target")
+    plt.xlabel("Time (s)")
+    plt.ylabel("Speed (rpm)")
+    plt.grid(True)
+    plt.legend()
+    plt.title("Best Axis 2 PI Speed Response")
+    plt.tight_layout()
+    plt.savefig(BEST_SPEED_PLOT_PATH, dpi=150)
+    print(f"Best speed data saved to: {BEST_SPEED_CSV_PATH}")
+    print(f"Best speed plot saved to: {BEST_SPEED_PLOT_PATH}")
