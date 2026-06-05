@@ -48,14 +48,16 @@ float32 TC3 = 0.02f;
 float32 C8  = 50.0f;
 // ================= HIL 贝叶斯优化全局变量 =================
 #define BO_RECORD_LENGTH 1000
-#define STEP_RECORD_LENGTH 1500
+#define STEP_RECORD_LENGTH 4000
 #define RECORD_LENGTH STEP_RECORD_LENGTH
 #define DUAL_RECORD_LENGTH BO_RECORD_LENGTH
-#define STEP1_END_INDEX 400
-#define STEP2_END_INDEX 950
+#define STEP1_END_INDEX 1000
+#define STEP2_END_INDEX 2500
+#define CURRENT_RECORD_LENGTH 667
+#define CURRENT_LOG_STRIDE 6
 #define HIL_STEP_SPEED_REF_40 (0.0133333f)
-#define HIL_HIGH_STEP1_END_INDEX 400
-#define HIL_HIGH_STEP2_END_INDEX 800
+#define HIL_HIGH_STEP1_END_INDEX 1000
+#define HIL_HIGH_STEP2_END_INDEX 2500
 #define HIL_HIGH_SPEED_REF_100 (0.0333333f)
 #define HIL_HIGH_SPEED_REF_200 (0.0666667f)
 #define HIL_HIGH_OVERSPEED_RPM (350.0f)
@@ -67,11 +69,13 @@ float32 C8  = 50.0f;
 #define HIL_SAFE_REVERSE_RPM   (-30.0f)
 int16 Log_Speed_x10[RECORD_LENGTH];
 int16 Log_Speed_2_x10[DUAL_RECORD_LENGTH];
-int16 Log_Ia_x100[RECORD_LENGTH];
-int16 Log_Ib_x100[RECORD_LENGTH];
-int16 Log_Ic_x100[RECORD_LENGTH];
+int16 Log_Ia_x100[CURRENT_RECORD_LENGTH];
+int16 Log_Ib_x100[CURRENT_RECORD_LENGTH];
+int16 Log_Ic_x100[CURRENT_RECORD_LENGTH];
 Uint16 Record_Index = 0;           // 记录索引
 Uint16 HIL_RecordLength = BO_RECORD_LENGTH;
+Uint16 HIL_CurrentStartIndex = 0;
+Uint16 HIL_CurrentEndIndex = BO_RECORD_LENGTH;
 Uint16 HIL_StepMode = 0;
 char Rx_Buffer[192];
 Uint16 Rx_Index = 0;
@@ -112,6 +116,9 @@ Uint16 HIL_HighOverspeedTicks_2 = 0;
 #define HIL_SPEED2_MAX_STEP_RPM (150.0f)
 #define HIL_SPEED2_MAX_SPIKES (3)
 #define DUAL_AXIS2_START_INDEX (300)
+#define HIL_START_IQ_MIN_PU (0.08f)
+#define HIL_START_IQ_MAX_PU (0.22f)
+#define HIL_START_IQ_RAMP_TICKS (1200)
 //================= PTDO 观测器专用参数================
 float32 P3  = 0.6f;      // 0 < p3 < 1
 float32 A33 = 1.0f;      // a3 > 0
@@ -143,6 +150,9 @@ float32 HIL_HighStepSpeedRef(Uint16 index);
 float32 HIL_SafeStepSpeedRef(Uint16 index);
 int16 HIL_CurrentAToX100(float32 current_a);
 void HIL_AppendFloat2(char *buf, Uint16 *idx, float32 val);
+void HIL_ResetAxis1RunState(void);
+Uint16 HIL_CurrentLogSlot(Uint16 index, Uint16 *slot);
+float32 HIL_StartupIqLimit(Uint16 index);
 
 static int16 HIL_SpeedRpmToX10(float32 speed_rpm)
 {
@@ -171,6 +181,29 @@ int16 HIL_CurrentAToX100(float32 current_a)
         return HIL_LOG_MIN_X10;
     }
     return (int16)scaled;
+}
+
+
+Uint16 HIL_CurrentLogSlot(Uint16 index, Uint16 *slot)
+{
+    if(index >= HIL_CurrentStartIndex && index < HIL_CurrentEndIndex)
+    {
+        *slot = (index - HIL_CurrentStartIndex) / CURRENT_LOG_STRIDE;
+        return (*slot < CURRENT_RECORD_LENGTH);
+    }
+    return 0;
+}
+
+
+float32 HIL_StartupIqLimit(Uint16 index)
+{
+    if(index >= HIL_START_IQ_RAMP_TICKS)
+    {
+        return HIL_START_IQ_MAX_PU;
+    }
+    return HIL_START_IQ_MIN_PU +
+           (HIL_START_IQ_MAX_PU - HIL_START_IQ_MIN_PU) *
+           ((float32)index / (float32)HIL_START_IQ_RAMP_TICKS);
 }
 
 
@@ -209,6 +242,7 @@ float32 Log_Spd2 = 0.0f;
 float32 Log_Iq1 = 0.0f;
 float32 Log_Iq2 = 0.0f;
 float32 d_hat_filtered = 0.0f;
+float32 omega_fdb_fil = 0.0f;
 
 float32 i=0;
 float32 j=0;
@@ -465,6 +499,55 @@ _iq Tc_2=0;
 _iq MfuncD1_2=0;
 _iq MfuncD2_2=0;
 _iq MfuncD3_2=0;
+
+void HIL_ResetAxis1RunState(void)
+{
+    Integral_f1 = 0.0f;
+    omega_hat = 0.0f;
+    omega_fdb_fil = 0.0f;
+    integral_sigma = 0.0f;
+    d_hat = 0.0f;
+    d_hat_filtered = 0.0f;
+
+    IQ_Given = 0;
+    IQ_Ref = 0;
+    IQ_Fdb = 0;
+    IQ_Error = 0;
+    IQ_Up = 0;
+    IQ_Up1 = 0;
+    IQ_Ui = 0;
+    IQ_OutPreSat = 0;
+    IQ_SatError = 0;
+    IQ_Out = 0;
+
+    ID_Given = 0;
+    ID_Ref = 0;
+    ID_Fdb = 0;
+    ID_Error = 0;
+    ID_Up = 0;
+    ID_Up1 = 0;
+    ID_Ui = 0;
+    ID_OutPreSat = 0;
+    ID_SatError = 0;
+    ID_Out = 0;
+
+    Speed_Ref = 0;
+    Speed_Fdb = 0;
+    Speed_Error = 0;
+    Speed_Up = 0;
+    Speed_Ui = 0;
+    Speed_OutPreSat = 0;
+    Speed_SatError = 0;
+    Speed_Out = 0;
+    Speed_run = 0;
+
+    RawThetaTmp = 0;
+    Speed = 0;
+    Log_Spd1 = 0.0f;
+    Log_Iq1 = 0.0f;
+    Ud = 0;
+    Uq = 0;
+}
 //===================================================================
 Uint16 Run_PMSM=2;
 Uint16 Run_PMSM_2=2;
@@ -886,10 +969,15 @@ if(Run_PMSM==1&&IPM_Fault==0)//初始位置定位算法
                         {
                         if(Record_Index < HIL_RecordLength)
                           {
+                          Uint16 current_slot;
                           Log_Speed_x10[Record_Index] = HIL_SpeedRpmToX10(actual_speed_rpm);
-                          Log_Ia_x100[Record_Index] = HIL_CurrentAToX100(_IQtoF(ia) * E_Ding_DianLiu);
-                          Log_Ib_x100[Record_Index] = HIL_CurrentAToX100(_IQtoF(ib) * E_Ding_DianLiu);
-                          Log_Ic_x100[Record_Index] = HIL_CurrentAToX100(_IQtoF(ic) * E_Ding_DianLiu);
+                          if(HIL_CurrentLogSlot(Record_Index, &current_slot) &&
+                             (((Record_Index - HIL_CurrentStartIndex) % CURRENT_LOG_STRIDE) == 0))
+                            {
+                            Log_Ia_x100[current_slot] = HIL_CurrentAToX100(_IQtoF(ia) * E_Ding_DianLiu);
+                            Log_Ib_x100[current_slot] = HIL_CurrentAToX100(_IQtoF(ib) * E_Ding_DianLiu);
+                            Log_Ic_x100[current_slot] = HIL_CurrentAToX100(_IQtoF(ic) * E_Ding_DianLiu);
+                            }
                           Record_Index++;
                           }
                          else
@@ -920,7 +1008,6 @@ if(Run_PMSM==1&&IPM_Fault==0)//初始位置定位算法
                     if (Run_PMSM == 1 && IPM_Fault == 0)
                     {
                         // 【核心修复1：输入端抗噪滤波】对原始速度进行极其轻微的滤波，抹平离散量化阶跃
-                        static float32 omega_fdb_fil = 0.0f;
                         omega_fdb_fil = 0.85f * omega_fdb_fil + 0.15f * omega_fdb;
 
                         // 计算观测误差
@@ -1033,6 +1120,13 @@ if(Run_PMSM==1&&IPM_Fault==0)//初始位置定位算法
              // 8. 限幅输出
                 if (iq_ref_pu > _IQtoF(Speed_OutMax)) iq_ref_pu = _IQtoF(Speed_OutMax);
                 if (iq_ref_pu < _IQtoF(Speed_OutMin)) iq_ref_pu = _IQtoF(Speed_OutMin);
+                if(Eval_State == 2 && HIL_StepMode == 2)
+                {
+                    Uint16 startup_index = (Record_Index > HIL_HIGH_STEP1_END_INDEX) ? (Record_Index - HIL_HIGH_STEP1_END_INDEX) : 0;
+                    float32 iq_limit = HIL_StartupIqLimit(startup_index);
+                    if(iq_ref_pu > iq_limit) iq_ref_pu = iq_limit;
+                    if(iq_ref_pu < -iq_limit) iq_ref_pu = -iq_limit;
+                }
 
                 if(HIL_ForceIq != 0)
                 {
@@ -1432,7 +1526,7 @@ if(Run_PMSM_2==1&&IPM_Fault_2==0)//轴2
             else{
             Speed_dis_2=_IQtoF(_IQmpy(Speed_2, _IQ(100)));}
 
-            if(Eval_State == 22)
+            if(Eval_State == 22 && HIL_StepMode == 2)
             {
                 float32 axis2_speed_rpm = _IQtoF(Speed_2) * (float32)BaseSpeed_2;
                 float32 axis2_delta_rpm = axis2_speed_rpm - HIL_LastValidSpeed_2;
@@ -1483,10 +1577,15 @@ if(axis2_delta_rpm < 0.0f) axis2_delta_rpm = -axis2_delta_rpm;
                 {
                     if(Record_Index < HIL_RecordLength)
                     {
+                        Uint16 current_slot;
                         Log_Speed_x10[Record_Index] = HIL_SpeedRpmToX10(axis2_speed_rpm);
-                        Log_Ia_x100[Record_Index] = HIL_CurrentAToX100(_IQtoF(ia_2) * E_Ding_DianLiu_2);
-                        Log_Ib_x100[Record_Index] = HIL_CurrentAToX100(_IQtoF(ib_2) * E_Ding_DianLiu_2);
-                        Log_Ic_x100[Record_Index] = HIL_CurrentAToX100(_IQtoF(ic_2) * E_Ding_DianLiu_2);
+                        if(HIL_CurrentLogSlot(Record_Index, &current_slot) &&
+                           (((Record_Index - HIL_CurrentStartIndex) % CURRENT_LOG_STRIDE) == 0))
+                        {
+                            Log_Ia_x100[current_slot] = HIL_CurrentAToX100(_IQtoF(ia_2) * E_Ding_DianLiu_2);
+                            Log_Ib_x100[current_slot] = HIL_CurrentAToX100(_IQtoF(ib_2) * E_Ding_DianLiu_2);
+                            Log_Ic_x100[current_slot] = HIL_CurrentAToX100(_IQtoF(ic_2) * E_Ding_DianLiu_2);
+                        }
                         Record_Index++;
                     }
                     else
@@ -1559,6 +1658,16 @@ if(axis2_delta_rpm < 0.0f) axis2_delta_rpm = -axis2_delta_rpm;
             Speed_2Ui=Speed_2Ui + _IQmpy(Speed_2Ki,Speed_2Up) + _IQmpy(Speed_2Ki,Speed_2SatError);
 
             Speed_2OutPreSat=Speed_2Up+Speed_2Ui;
+
+            if(Eval_State == 22 && HIL_StepMode == 2)
+            {
+                Uint16 startup_index_2 = (Record_Index > HIL_HIGH_STEP1_END_INDEX) ? (Record_Index - HIL_HIGH_STEP1_END_INDEX) : 0;
+                _iq iq2_limit = _IQ(HIL_StartupIqLimit(startup_index_2));
+                if(Speed_2OutPreSat > iq2_limit)
+                    Speed_2OutPreSat = iq2_limit;
+                else if(Speed_2OutPreSat < -iq2_limit)
+                    Speed_2OutPreSat = -iq2_limit;
+            }
 
             if(Speed_2OutPreSat>Speed_2OutMax)
                 Speed_2Out=Speed_2OutMax;
@@ -2127,6 +2236,8 @@ float32 HIL_SafeStepSpeedRef(Uint16 index)
 
 void HIL_Evaluation_Task(void)
 {
+    Uint16 clear_i;
+
     HIL_Poll_Rx();
 
     if(HIL_FailCode != 0)//故障处理入口
@@ -2175,6 +2286,14 @@ void HIL_Evaluation_Task(void)
     {
         New_Params_Flag = 0;
         HIL_RecordLength = (HIL_StepMode != 0) ? STEP_RECORD_LENGTH : BO_RECORD_LENGTH;
+        HIL_CurrentStartIndex = 0;
+        HIL_CurrentEndIndex = HIL_RecordLength;
+        for(clear_i = 0; clear_i < CURRENT_RECORD_LENGTH; clear_i++)
+        {
+            Log_Ia_x100[clear_i] = 0;
+            Log_Ib_x100[clear_i] = 0;
+            Log_Ic_x100[clear_i] = 0;
+        }
         HIL_BoostDelay = 0;
         HIL_ForceIq = 0;
         HIL_ForceIqPu = 0.0f;
@@ -2195,6 +2314,14 @@ void HIL_Evaluation_Task(void)
     {
         New_PI2_Params_Flag = 0;
         HIL_RecordLength = (HIL_StepMode != 0) ? STEP_RECORD_LENGTH : BO_RECORD_LENGTH;
+        HIL_CurrentStartIndex = 0;
+        HIL_CurrentEndIndex = HIL_RecordLength;
+        for(clear_i = 0; clear_i < CURRENT_RECORD_LENGTH; clear_i++)
+        {
+            Log_Ia_x100[clear_i] = 0;
+            Log_Ib_x100[clear_i] = 0;
+            Log_Ic_x100[clear_i] = 0;
+        }
         HIL_BoostDelay = 0;
         HIL_ForceIq = 0;
         HIL_ForceIqPu = 0.0f;
@@ -2363,18 +2490,8 @@ void HIL_Evaluation_Task(void)
         eva_close();
         Run_PMSM_2 = 2;
         eva_close_2();
-        Integral_f1 = 0.0f;
-        omega_hat = 0.0f;
-        integral_sigma = 0.0f;
-        d_hat = 0.0f;
-        d_hat_filtered = 0.0f;
-        IQ_Given = 0;
-        IQ_Ui = 0;
-        ID_Ui = 0;
-        Speed_Ui = 0;
+        HIL_ResetAxis1RunState();
         Record_Index = 0;
-        Speed = 0;
-        Log_Spd1 = 0.0f;
         HIL_LastValidSpeed = 0.0f;
         HIL_MotionSeen = 0;
         SpeedRef = HIL_TARGET_SPEED_REF;
@@ -2551,6 +2668,7 @@ if(U_dc_dis <= 15)
     {
         char tx_buf[80];
         Uint16 i;
+        Uint16 finished_state = Eval_State;
 
         if(Eval_State == 23)
         {
@@ -2568,13 +2686,23 @@ if(U_dc_dis <= 15)
         for(i = 0; i < HIL_RecordLength; i++)
         {
             Uint16 idx = 0;
+            Uint16 current_slot;
+            int16 ia_log = 0;
+            int16 ib_log = 0;
+            int16 ic_log = 0;
+            if(HIL_CurrentLogSlot(i, &current_slot))
+            {
+                ia_log = Log_Ia_x100[current_slot];
+                ib_log = Log_Ib_x100[current_slot];
+                ic_log = Log_Ic_x100[current_slot];
+            }
             HIL_AppendFloat2(tx_buf, &idx, ((float32)Log_Speed_x10[i]) * 0.1f);
             tx_buf[idx++] = ',';
-            HIL_AppendFloat2(tx_buf, &idx, ((float32)Log_Ia_x100[i]) * 0.01f);
+            HIL_AppendFloat2(tx_buf, &idx, ((float32)ia_log) * 0.01f);
             tx_buf[idx++] = ',';
-            HIL_AppendFloat2(tx_buf, &idx, ((float32)Log_Ib_x100[i]) * 0.01f);
+            HIL_AppendFloat2(tx_buf, &idx, ((float32)ib_log) * 0.01f);
             tx_buf[idx++] = ',';
-            HIL_AppendFloat2(tx_buf, &idx, ((float32)Log_Ic_x100[i]) * 0.01f);
+            HIL_AppendFloat2(tx_buf, &idx, ((float32)ic_log) * 0.01f);
             tx_buf[idx++] = '\n';
             tx_buf[idx] = '\0';
 
@@ -2584,6 +2712,10 @@ if(U_dc_dis <= 15)
         while(ScibRegs.SCIFFRX.bit.RXFFST > 0) { ScibRegs.SCIRXBUF.all; }
         EINT;
         Eval_State = 0;
+        if(finished_state == 3)
+        {
+            HIL_ResetAxis1RunState();
+        }
         TX232_String("DATA_END\n");
         TX232_String("READY\n");
     }
