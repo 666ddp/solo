@@ -67,6 +67,9 @@ float32 C8  = 50.0f;
 #define HIL_SAFE_REVERSE_RPM   (-30.0f)
 int16 Log_Speed_x10[RECORD_LENGTH];
 int16 Log_Speed_2_x10[DUAL_RECORD_LENGTH];
+int16 Log_Ia_x100[RECORD_LENGTH];
+int16 Log_Ib_x100[RECORD_LENGTH];
+int16 Log_Ic_x100[RECORD_LENGTH];
 Uint16 Record_Index = 0;           // 记录索引
 Uint16 HIL_RecordLength = BO_RECORD_LENGTH;
 Uint16 HIL_StepMode = 0;
@@ -153,6 +156,8 @@ float32 HIL_RampSpeedRef(float32 current_ref, float32 target_ref, Uint16 base_sp
 float32 HIL_StartupIqLimit(float32 abs_speed_rpm);
 float32 HIL_ClampFloat(float32 value, float32 min_value, float32 max_value);
 void HIL_ResetSoftStart(void);
+int16 HIL_CurrentAToX100(float32 current_a);
+void HIL_AppendFloat2(char *buf, Uint16 *idx, float32 val);
 
 static int16 HIL_SpeedRpmToX10(float32 speed_rpm)
 {
@@ -166,6 +171,47 @@ static int16 HIL_SpeedRpmToX10(float32 speed_rpm)
         return HIL_LOG_MIN_X10;
     }
     return (int16)scaled;
+}
+
+
+int16 HIL_CurrentAToX100(float32 current_a)
+{
+    float32 scaled = current_a * 100.0f;
+    if(scaled > (float32)HIL_LOG_MAX_X10)
+    {
+        return HIL_LOG_MAX_X10;
+    }
+    if(scaled < (float32)HIL_LOG_MIN_X10)
+    {
+        return HIL_LOG_MIN_X10;
+    }
+    return (int16)scaled;
+}
+
+
+void HIL_AppendFloat2(char *buf, Uint16 *idx, float32 val)
+{
+    Uint16 int_part, frac_part;
+
+    if(val != val) { val = 0.0f; }
+    if(val > 9999.0f) val = 9999.0f;
+    if(val < -999.0f) val = -999.0f;
+    if(val < 0.0f)
+    {
+        val = -val;
+        buf[(*idx)++] = '-';
+    }
+
+    int_part = (Uint16)val;
+    frac_part = (Uint16)((val - (float32)int_part) * 100.0f + 0.5f);
+    if(frac_part >= 100) { frac_part = 99; }
+    if(int_part >= 1000) buf[(*idx)++] = '0' + int_part/1000;
+    if(int_part >= 100)  buf[(*idx)++] = '0' + (int_part/100)%10;
+    if(int_part >= 10)   buf[(*idx)++] = '0' + (int_part/10)%10;
+    buf[(*idx)++] = '0' + (int_part % 10);
+    buf[(*idx)++] = '.';
+    buf[(*idx)++] = '0' + (frac_part / 10);
+    buf[(*idx)++] = '0' + (frac_part % 10);
 }
 
 //*****************************************************************************************************
@@ -848,6 +894,9 @@ if(Run_PMSM==1&&IPM_Fault==0)//初始位置定位算法
                         if(Record_Index < HIL_RecordLength)
                           {
                           Log_Speed_x10[Record_Index] = HIL_SpeedRpmToX10(actual_speed_rpm);
+                          Log_Ia_x100[Record_Index] = HIL_CurrentAToX100(_IQtoF(ia) * E_Ding_DianLiu);
+                          Log_Ib_x100[Record_Index] = HIL_CurrentAToX100(_IQtoF(ib) * E_Ding_DianLiu);
+                          Log_Ic_x100[Record_Index] = HIL_CurrentAToX100(_IQtoF(ic) * E_Ding_DianLiu);
                           Record_Index++;
                           }
                          else
@@ -1447,6 +1496,9 @@ if(axis2_delta_rpm < 0.0f) axis2_delta_rpm = -axis2_delta_rpm;
                     if(Record_Index < HIL_RecordLength)
                     {
                         Log_Speed_x10[Record_Index] = HIL_SpeedRpmToX10(axis2_speed_rpm);
+                        Log_Ia_x100[Record_Index] = HIL_CurrentAToX100(_IQtoF(ia_2) * E_Ding_DianLiu_2);
+                        Log_Ib_x100[Record_Index] = HIL_CurrentAToX100(_IQtoF(ib_2) * E_Ding_DianLiu_2);
+                        Log_Ic_x100[Record_Index] = HIL_CurrentAToX100(_IQtoF(ic_2) * E_Ding_DianLiu_2);
                         Record_Index++;
                     }
                     else
@@ -2596,7 +2648,7 @@ if(U_dc_dis <= 15)
 
     if(Eval_State == 3 || Eval_State == 23)
     {
-        char tx_buf[32];
+        char tx_buf[80];
         Uint16 i;
 
         if(Eval_State == 23)
@@ -2614,24 +2666,14 @@ if(U_dc_dis <= 15)
         DINT;
         for(i = 0; i < HIL_RecordLength; i++)
         {
-            float32 val = ((float32)Log_Speed_x10[i]) * 0.1f;
-            Uint16 int_part, frac_part, idx = 0;
-
-            if(val != val) { val = 0.0f; }
-            if(val > 9999.0f) val = 9999.0f;
-            if(val < -999.0f) val = -999.0f;
-            if(val < 0.0f) { val = -val; tx_buf[idx++] = '-'; }
-
-            int_part = (Uint16)val;
-            frac_part = (Uint16)((val - (float32)int_part) * 100.0f + 0.5f);
-            if(frac_part >= 100) { frac_part = 99; }
-            if(int_part >= 1000) tx_buf[idx++] = '0' + int_part/1000;
-            if(int_part >= 100)  tx_buf[idx++] = '0' + (int_part/100)%10;
-            if(int_part >= 10)   tx_buf[idx++] = '0' + (int_part/10)%10;
-            tx_buf[idx++] = '0' + (int_part % 10);
-            tx_buf[idx++] = '.';
-            tx_buf[idx++] = '0' + (frac_part / 10);
-            tx_buf[idx++] = '0' + (frac_part % 10);
+            Uint16 idx = 0;
+            HIL_AppendFloat2(tx_buf, &idx, ((float32)Log_Speed_x10[i]) * 0.1f);
+            tx_buf[idx++] = ',';
+            HIL_AppendFloat2(tx_buf, &idx, ((float32)Log_Ia_x100[i]) * 0.01f);
+            tx_buf[idx++] = ',';
+            HIL_AppendFloat2(tx_buf, &idx, ((float32)Log_Ib_x100[i]) * 0.01f);
+            tx_buf[idx++] = ',';
+            HIL_AppendFloat2(tx_buf, &idx, ((float32)Log_Ic_x100[i]) * 0.01f);
             tx_buf[idx++] = '\n';
             tx_buf[idx] = '\0';
 
