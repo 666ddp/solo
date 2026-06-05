@@ -95,8 +95,6 @@ float32 HIL_ForceIqPu = 0.0f;
 Uint16 HIL_Speed2SpikeCount = 0;
 Uint16 HIL_HighOverspeedTicks = 0;
 Uint16 HIL_HighOverspeedTicks_2 = 0;
-float32 HIL_Axis1RefRamp = 0.0f;
-float32 HIL_Axis2RefRamp = 0.0f;
 
 #define HIL_TARGET_SPEED_REF (0.0267f)
 #define HIL_LOG_MAX_X10 32767
@@ -113,14 +111,6 @@ float32 HIL_Axis2RefRamp = 0.0f;
 #define HIL_SPEED2_MAX_ABS_RPM (300.0f)
 #define HIL_SPEED2_MAX_STEP_RPM (150.0f)
 #define HIL_SPEED2_MAX_SPIKES (3)
-#define HIL_REF_RAMP_RPM_PER_TICK (0.40f)
-#define HIL_START_IQ_LIMIT_PU (0.15f)
-#define HIL_LOW_IQ_LIMIT_PU   (0.25f)
-#define HIL_MID_IQ_LIMIT_PU   (0.35f)
-#define HIL_RUN_IQ_LIMIT_PU   (0.60f)
-#define HIL_IQ_LIMIT_SPEED1_RPM (10.0f)
-#define HIL_IQ_LIMIT_SPEED2_RPM (40.0f)
-#define HIL_IQ_LIMIT_SPEED3_RPM (80.0f)
 #define DUAL_AXIS2_START_INDEX (300)
 //================= PTDO 观测器专用参数================
 float32 P3  = 0.6f;      // 0 < p3 < 1
@@ -151,11 +141,6 @@ void HIL_Poll_Rx(void);
 float32 HIL_StepSpeedRef(Uint16 index);
 float32 HIL_HighStepSpeedRef(Uint16 index);
 float32 HIL_SafeStepSpeedRef(Uint16 index);
-float32 HIL_SelectStepSpeedRef(Uint16 index);
-float32 HIL_RampSpeedRef(float32 current_ref, float32 target_ref, Uint16 base_speed);
-float32 HIL_StartupIqLimit(float32 abs_speed_rpm);
-float32 HIL_ClampFloat(float32 value, float32 min_value, float32 max_value);
-void HIL_ResetSoftStart(void);
 int16 HIL_CurrentAToX100(float32 current_a);
 void HIL_AppendFloat2(char *buf, Uint16 *idx, float32 val);
 
@@ -809,10 +794,18 @@ if(Run_PMSM==1&&IPM_Fault==0)//初始位置定位算法
                     float32 actual_speed_rpm = _IQtoF(Speed) * (float32)BaseSpeed; // 现在 Speed 有真实数据了
                     if(Eval_State == 2 && HIL_StepMode != 0)
                     {
-                        HIL_Axis1RefRamp = HIL_RampSpeedRef(HIL_Axis1RefRamp,
-                                                            HIL_SelectStepSpeedRef(Record_Index),
-                                                            BaseSpeed);
-                        SpeedRef = HIL_Axis1RefRamp;
+                        if(HIL_StepMode == 2)
+                        {
+                            SpeedRef = HIL_HighStepSpeedRef(Record_Index);
+                        }
+                        else if(HIL_StepMode == 3)
+                        {
+                            SpeedRef = HIL_SafeStepSpeedRef(Record_Index);
+                        }
+                        else
+                        {
+                            SpeedRef = HIL_StepSpeedRef(Record_Index);
+                        }
                     }
                     float32 target_speed_rpm = SpeedRef * (float32)BaseSpeed;
                     float32 speed_abs_rpm;
@@ -1040,11 +1033,6 @@ if(Run_PMSM==1&&IPM_Fault==0)//初始位置定位算法
              // 8. 限幅输出
                 if (iq_ref_pu > _IQtoF(Speed_OutMax)) iq_ref_pu = _IQtoF(Speed_OutMax);
                 if (iq_ref_pu < _IQtoF(Speed_OutMin)) iq_ref_pu = _IQtoF(Speed_OutMin);
-                if(Eval_State == 2 || Eval_State == 31)
-                {
-                    float32 iq_limit_pu = HIL_StartupIqLimit(speed_abs_rpm);
-                    iq_ref_pu = HIL_ClampFloat(iq_ref_pu, -iq_limit_pu, iq_limit_pu);
-                }
 
                 if(HIL_ForceIq != 0)
                 {
@@ -1542,10 +1530,18 @@ if(axis2_delta_rpm < 0.0f) axis2_delta_rpm = -axis2_delta_rpm;
   //=================速度环PI===================================
             if(Eval_State == 22 && HIL_StepMode != 0)
             {
-                HIL_Axis2RefRamp = HIL_RampSpeedRef(HIL_Axis2RefRamp,
-                                                    HIL_SelectStepSpeedRef(Record_Index),
-                                                    BaseSpeed_2);
-                SpeedRef_2 = HIL_Axis2RefRamp;
+                if(HIL_StepMode == 2)
+                {
+                    SpeedRef_2 = HIL_HighStepSpeedRef(Record_Index);
+                }
+                else if(HIL_StepMode == 3)
+                {
+                    SpeedRef_2 = HIL_SafeStepSpeedRef(Record_Index);
+                }
+                else
+                {
+                    SpeedRef_2 = HIL_StepSpeedRef(Record_Index);
+                }
             }
             if(Eval_State == 31 || Eval_State == 22)
             {
@@ -1570,18 +1566,6 @@ if(axis2_delta_rpm < 0.0f) axis2_delta_rpm = -axis2_delta_rpm;
                 Speed_2Out=Speed_2OutMin;
             else
                 Speed_2Out=Speed_2OutPreSat;
-
-            if(Eval_State == 22 || Eval_State == 31)
-            {
-                float32 axis2_abs_speed_rpm = _IQtoF(Speed_2);
-                float32 axis2_iq_limit_pu;
-                if(axis2_abs_speed_rpm < 0.0f) axis2_abs_speed_rpm = -axis2_abs_speed_rpm;
-                axis2_abs_speed_rpm *= (float32)BaseSpeed_2;
-                axis2_iq_limit_pu = HIL_StartupIqLimit(axis2_abs_speed_rpm);
-                Speed_2Out = _IQ(HIL_ClampFloat(_IQtoF(Speed_2Out),
-                                                -axis2_iq_limit_pu,
-                                                axis2_iq_limit_pu));
-            }
 
             Speed_2SatError=Speed_2Out-Speed_2OutPreSat;
 
@@ -2141,81 +2125,6 @@ float32 HIL_SafeStepSpeedRef(Uint16 index)
 }
 
 
-float32 HIL_SelectStepSpeedRef(Uint16 index)
-{
-    if(HIL_StepMode == 2)
-    {
-        return HIL_HighStepSpeedRef(index);
-    }
-    if(HIL_StepMode == 3)
-    {
-        return HIL_SafeStepSpeedRef(index);
-    }
-    return HIL_StepSpeedRef(index);
-}
-
-
-float32 HIL_RampSpeedRef(float32 current_ref, float32 target_ref, Uint16 base_speed)
-{
-    float32 step_ref;
-
-    if(base_speed == 0)
-    {
-        return target_ref;
-    }
-
-    step_ref = HIL_REF_RAMP_RPM_PER_TICK / (float32)base_speed;
-    if(target_ref > current_ref + step_ref)
-    {
-        return current_ref + step_ref;
-    }
-    if(target_ref < current_ref - step_ref)
-    {
-        return current_ref - step_ref;
-    }
-    return target_ref;
-}
-
-
-float32 HIL_StartupIqLimit(float32 abs_speed_rpm)
-{
-    if(abs_speed_rpm < HIL_IQ_LIMIT_SPEED1_RPM)
-    {
-        return HIL_START_IQ_LIMIT_PU;
-    }
-    if(abs_speed_rpm < HIL_IQ_LIMIT_SPEED2_RPM)
-    {
-        return HIL_LOW_IQ_LIMIT_PU;
-    }
-    if(abs_speed_rpm < HIL_IQ_LIMIT_SPEED3_RPM)
-    {
-        return HIL_MID_IQ_LIMIT_PU;
-    }
-    return HIL_RUN_IQ_LIMIT_PU;
-}
-
-
-float32 HIL_ClampFloat(float32 value, float32 min_value, float32 max_value)
-{
-    if(value > max_value)
-    {
-        return max_value;
-    }
-    if(value < min_value)
-    {
-        return min_value;
-    }
-    return value;
-}
-
-
-void HIL_ResetSoftStart(void)
-{
-    HIL_Axis1RefRamp = 0.0f;
-    HIL_Axis2RefRamp = 0.0f;
-}
-
-
 void HIL_Evaluation_Task(void)
 {
     HIL_Poll_Rx();
@@ -2245,7 +2154,6 @@ void HIL_Evaluation_Task(void)
         HIL_Speed2SpikeCount = 0;
         HIL_HighOverspeedTicks = 0;
         HIL_HighOverspeedTicks_2 = 0;
-        HIL_ResetSoftStart();
         Speed = 0;
         Speed_2 = 0;
         Log_Spd1 = 0.0f;
@@ -2275,7 +2183,6 @@ void HIL_Evaluation_Task(void)
         HIL_LastValidSpeed = 0.0f;
         HIL_HighOverspeedTicks = 0;
         HIL_HighOverspeedTicks_2 = 0;
-        HIL_ResetSoftStart();
         Init_SiShu();
         DC_ON_0;
         Pwm_EN_0;
@@ -2299,7 +2206,6 @@ void HIL_Evaluation_Task(void)
         HIL_Speed2SpikeCount = 0;
         HIL_HighOverspeedTicks = 0;
         HIL_HighOverspeedTicks_2 = 0;
-        HIL_ResetSoftStart();
         DC_ON2_0;
         Pwm_EN2_0;
         TX232_String("AK\n");
@@ -2328,7 +2234,6 @@ void HIL_Evaluation_Task(void)
         Log_Spd2 = 0.0f;
         Record_Index = 0;
         SpeedRef_2 = HIL_TARGET_SPEED_REF;
-        HIL_Axis2RefRamp = 0.0f;
         Modulation_2 = RUN_MODULATION;
         LocationFlag_2 = 1;
         Position_2 = 1;
@@ -2365,7 +2270,6 @@ void HIL_Evaluation_Task(void)
         HIL_Speed2SpikeCount = 0;
         HIL_HighOverspeedTicks = 0;
         HIL_HighOverspeedTicks_2 = 0;
-        HIL_ResetSoftStart();
         Init_SiShu();
         DC_ON_0;
         DC_ON2_0;
@@ -2419,7 +2323,6 @@ void HIL_Evaluation_Task(void)
         Log_Spd2 = 0.0f;
         SpeedRef = HIL_TARGET_SPEED_REF;
         SpeedRef_2 = HIL_TARGET_SPEED_REF;
-        HIL_ResetSoftStart();
         Modulation = RUN_MODULATION;
         Modulation_2 = RUN_MODULATION;
         eva_open();
@@ -2475,7 +2378,6 @@ void HIL_Evaluation_Task(void)
         HIL_LastValidSpeed = 0.0f;
         HIL_MotionSeen = 0;
         SpeedRef = HIL_TARGET_SPEED_REF;
-        HIL_Axis1RefRamp = 0.0f;
         Modulation = RUN_MODULATION;
         eva_open();
         Run_PMSM = 1;
@@ -2528,7 +2430,6 @@ void HIL_Evaluation_Task(void)
         HIL_MotionSeen = 0;
         HIL_StartupCheckTicks = 0;
         SpeedRef = HIL_TARGET_SPEED_REF;
-        HIL_Axis1RefRamp = 0.0f;
         if(Dual_Mode != 0)
         {
             Eval_State = 31;
