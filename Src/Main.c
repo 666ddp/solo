@@ -1526,7 +1526,7 @@ if(Run_PMSM_2==1&&IPM_Fault_2==0)//轴2
             else{
             Speed_dis_2=_IQtoF(_IQmpy(Speed_2, _IQ(100)));}
 
-            if(Eval_State == 22 && HIL_StepMode == 2)
+            if(Eval_State == 22)
             {
                 float32 axis2_speed_rpm = _IQtoF(Speed_2) * (float32)BaseSpeed_2;
                 float32 axis2_delta_rpm = axis2_speed_rpm - HIL_LastValidSpeed_2;

@@ -32,7 +32,7 @@ CHINESE_FONT_NAME = setup_chinese_font()
 DSP_PORT = "COM3"
 BAUD_RATE = 115200
 TARGET_RPM = 80.0
-RECORD_LENGTH = 2000
+RECORD_LENGTH = 1000
 DT = 0.001
 COOLDOWN = 10.0
 N_CALLS = 40
@@ -56,12 +56,19 @@ SETTLING_BAND = 0.08
 SMOOTHING_WINDOW = 25
 SPIKE_MAX_ABS_RPM = 300.0
 SPIKE_MAX_STEP_RPM = 150.0
+OSC_EVAL_FRACTION = 0.90
+OSC_STD_WEIGHT = 120.0
+OSC_RANGE_WEIGHT = 20.0
+OSC_MEAN_ERROR_WEIGHT = 35.0
+CURRENT_WARN_A = 4.5
+CURRENT_RMS_WARN_A = 3.0
+CURRENT_HARD_A = 5.8
 RUN_TIMESTAMP = time.strftime("%Y%m%d_%H%M%S")
 RESULT_DIR = Path(__file__).with_name("axis1_bo_results")
 RESULT_DIR.mkdir(exist_ok=True)
 LOG_PATH = RESULT_DIR / f"axis1_bo_results_{RUN_TIMESTAMP}.csv"
 SCORE_PLOT_PATH = RESULT_DIR / f"axis1_bo_score_history_{RUN_TIMESTAMP}.png"
-BEST_SPEED_CSV_PATH = RESULT_DIR / f"axis1_best_speed_2000pts_{RUN_TIMESTAMP}.csv"
+BEST_SPEED_CSV_PATH = RESULT_DIR / f"axis1_best_speed_1000pts_{RUN_TIMESTAMP}.csv"
 BEST_SPEED_PLOT_PATH = RESULT_DIR / f"axis1_best_speed_waveform_{RUN_TIMESTAMP}.png"
 LIVE_SCORE_PLOT = True
 
@@ -75,6 +82,7 @@ except Exception as exc:
 
 
 best_speed_data = None
+best_current_data = None
 best_params = None
 best_score = float("inf")
 score_history = []
@@ -87,6 +95,8 @@ PARAM_NAMES = ("P1", "P2", "A11", "B11", "A22", "B22", "C3", "P3", "A33", "B33",
 
 LOG_PATH.write_text(
     "trial,status,score,rise_time,settling_time,overshoot,tail_mean,tail_max,"
+    "osc_std,osc_range,osc_mean_error,osc_penalty,"
+    "current_peak,current_rms,current_penalty,"
     + ",".join(PARAM_NAMES)
     + "\n",
     encoding="utf-8",
@@ -102,6 +112,10 @@ def append_result(status, score, metrics, params):
             f"{metrics['rise_time']:.6f},{metrics['settling_time']:.6f},"
             f"{metrics['overshoot']:.6f},{metrics['tail_mean']:.6f},"
             f"{metrics['tail_max']:.6f},"
+            f"{metrics['osc_std']:.6f},{metrics['osc_range']:.6f},"
+            f"{metrics['osc_mean_error']:.6f},{metrics['osc_penalty']:.6f},"
+            f"{metrics['current_peak']:.6f},{metrics['current_rms']:.6f},"
+            f"{metrics['current_penalty']:.6f},"
             f"{param_text}\n"
         )
 
@@ -247,8 +261,9 @@ def wait_for_ready_after_data():
     return False
 
 
-def receive_speed_data():
+def receive_trial_data():
     speed_data = []
+    current_data = []
     saw_data_end = False
     deadline = time.time() + DATA_TIMEOUT
 
@@ -274,7 +289,12 @@ def receive_speed_data():
             break
         try:
             if len(speed_data) < RECORD_LENGTH:
-                speed_data.append(float(line))
+                parts = [part.strip() for part in line.split(",")]
+                speed_data.append(float(parts[0]))
+                if len(parts) >= 4:
+                    current_data.append([float(parts[1]), float(parts[2]), float(parts[3])])
+                else:
+                    current_data.append([0.0, 0.0, 0.0])
         except ValueError:
             continue
 
@@ -286,8 +306,12 @@ def receive_speed_data():
 
     if len(speed_data) < RECORD_LENGTH:
         speed_data.extend([speed_data[-1]] * (RECORD_LENGTH - len(speed_data)))
+        current_data.extend([current_data[-1]] * (RECORD_LENGTH - len(current_data)))
 
-    return np.asarray(speed_data[:RECORD_LENGTH], dtype=float)
+    return (
+        np.asarray(speed_data[:RECORD_LENGTH], dtype=float),
+        np.asarray(current_data[:RECORD_LENGTH], dtype=float),
+    )
 
 
 def remove_speed_spikes(speed_array):
@@ -309,7 +333,25 @@ def remove_speed_spikes(speed_array):
     return clean
 
 
-def calculate_score(speed_array):
+def calculate_current_metrics(current_array, ignore_count):
+    current_array = np.asarray(current_array, dtype=float)
+    if current_array.ndim != 2 or current_array.shape[1] != 3 or len(current_array) == 0:
+        return 0.0, 0.0, 0.0
+
+    eval_current = current_array[min(ignore_count, len(current_array) - 1):]
+    abs_current = np.abs(eval_current)
+    phase_abs = np.max(abs_current, axis=1)
+    current_peak = float(np.max(phase_abs))
+    current_rms = float(np.sqrt(np.mean(eval_current ** 2)))
+    current_penalty = (
+        max(0.0, current_peak - CURRENT_WARN_A) * 3000.0
+        + max(0.0, current_rms - CURRENT_RMS_WARN_A) * 2000.0
+        + max(0.0, current_peak - CURRENT_HARD_A) * 20000.0
+    )
+    return current_peak, current_rms, current_penalty
+
+
+def calculate_score(speed_array, current_array=None):
     speed_array = remove_speed_spikes(speed_array)
     speed_abs = np.abs(speed_array)
     if SMOOTHING_WINDOW > 1 and len(speed_abs) >= SMOOTHING_WINDOW:
@@ -323,10 +365,20 @@ def calculate_score(speed_array):
     response = speed_abs[ignore_count:]
     start = int(len(response) * (1.0 - TAIL_FRACTION))
     eval_data = response[start:]
+    osc_end = max(1, int(len(response) * OSC_EVAL_FRACTION))
+    osc_data = response[:osc_end]
 
     tail_mean = float(np.mean(eval_data))
     tail_max = float(np.max(eval_data))
     overshoot = max(0.0, float(np.max(response) - TARGET_RPM))
+    osc_std = float(np.std(osc_data))
+    osc_range = float(np.max(osc_data) - np.min(osc_data))
+    osc_mean_error = float(np.mean(np.abs(TARGET_RPM - osc_data)))
+    osc_penalty = (
+        osc_std * OSC_STD_WEIGHT
+        + osc_range * OSC_RANGE_WEIGHT
+        + osc_mean_error * OSC_MEAN_ERROR_WEIGHT
+    )
 
     metrics = {
         "rise_time": DT * len(response),
@@ -334,7 +386,21 @@ def calculate_score(speed_array):
         "overshoot": overshoot,
         "tail_mean": tail_mean,
         "tail_max": tail_max,
+        "osc_std": osc_std,
+        "osc_range": osc_range,
+        "osc_mean_error": osc_mean_error,
+        "osc_penalty": osc_penalty,
+        "current_peak": 0.0,
+        "current_rms": 0.0,
+        "current_penalty": 0.0,
     }
+
+    if current_array is not None:
+        (
+            metrics["current_peak"],
+            metrics["current_rms"],
+            metrics["current_penalty"],
+        ) = calculate_current_metrics(current_array, ignore_count)
 
     if tail_mean < MIN_VALID_RPM:
         return FAIL_SCORE, metrics
@@ -359,15 +425,17 @@ def calculate_score(speed_array):
     return (
         metrics["rise_time"] * 4000.0
         + metrics["settling_time"] * 1800.0
-        + overshoot * 100.0
+        + overshoot * 300.0
         + steady_error * 50.0
         + ripple * 8.0
         + steady_itae * 0.5
+        + metrics["osc_penalty"]
+        + metrics["current_penalty"]
     ), metrics
 
 
 def run_dsp_experiment(params):
-    global best_speed_data, best_params, best_score, trial_count
+    global best_speed_data, best_current_data, best_params, best_score, trial_count
     trial_count += 1
 
     param_map = dict(zip(PARAM_NAMES, params))
@@ -383,18 +451,26 @@ def run_dsp_experiment(params):
         "overshoot": 0.0,
         "tail_mean": 0.0,
         "tail_max": 0.0,
+        "osc_std": 0.0,
+        "osc_range": 0.0,
+        "osc_mean_error": 0.0,
+        "osc_penalty": 0.0,
+        "current_peak": 0.0,
+        "current_rms": 0.0,
+        "current_penalty": 0.0,
     }
 
     improved_best = False
 
     if wait_for_ack(cmd):
         print("   ACK received, waiting for data...")
-        speed_data = receive_speed_data()
-        if speed_data is None:
+        trial_data = receive_trial_data()
+        if trial_data is None:
             print("   No valid speed data")
             status = "NO_DATA"
         else:
-            score, metrics = calculate_score(speed_data)
+            speed_data, current_data = trial_data
+            score, metrics = calculate_score(speed_data, current_data)
             tail = np.abs(speed_data[int(RECORD_LENGTH * (1.0 - TAIL_FRACTION)):])
             status = "OK" if score < FAIL_SCORE else "LOW_SPEED"
             print(
@@ -402,12 +478,15 @@ def run_dsp_experiment(params):
                 f"rise={metrics['rise_time']:.3f}s, "
                 f"settle={metrics['settling_time']:.3f}s, "
                 f"overshoot={metrics['overshoot']:.1f} rpm, "
-                f"tail_mean={metrics['tail_mean']:.1f} rpm"
+                f"tail_mean={metrics['tail_mean']:.1f} rpm, "
+                f"Ipk={metrics['current_peak']:.2f}A, "
+                f"Irms={metrics['current_rms']:.2f}A"
             )
             if score < best_score:
                 best_score = score
                 best_params = tuple(params)
                 best_speed_data = speed_data.copy()
+                best_current_data = current_data.copy()
                 improved_best = True
                 print(f"   New best score: {best_score:.1f}")
     else:
@@ -427,17 +506,17 @@ def run_dsp_experiment(params):
 # PTSMC+PTDO parameter structure in the paper, but are kept as HIL search
 # ranges for this motor instead of copying one paper motor's final values.
 space = [
-    Real(0.85, 0.99, name="P1"),
-    Real(0.50, 0.95, name="P2"),
-    Real(20.0, 80.0, name="A11"),
-    Real(0.05, 5.0, name="B11"),
-    Real(20.0, 90.0, name="A22"),
-    Real(220.0, 320.0, name="B22"),
-    Real(0.80, 1.20, name="C3"),
-    Real(0.85, 0.99, name="P3"),
-    Real(100.0, 180.0, name="A33"),
-    Real(20.0, 90.0, name="B33"),
-    Real(50.0, 500.0, name="C8"),
+    Real(0.75, 0.99, name="P1"),
+    Real(0.45, 0.99, name="P2"),
+    Real(20.0, 120.0, name="A11"),
+    Real(0.01, 5.0, name="B11"),
+    Real(10.0, 90.0, name="A22"),
+    Real(200.0, 340.0, name="B22"),
+    Real(0.70, 1.40, name="C3"),
+    Real(0.80, 0.995, name="P3"),
+    Real(80.0, 200.0, name="A33"),
+    Real(10.0, 100.0, name="B33"),
+    Real(50.0, 800.0, name="C8"),
 ]
 
 print("=====================================================")
@@ -485,33 +564,43 @@ if score_history:
 
 if best_speed_data is not None:
     t = np.arange(len(best_speed_data)) * DT
+    if best_current_data is None:
+        best_current_data = np.zeros((len(best_speed_data), 3), dtype=float)
     np.savetxt(
         BEST_SPEED_CSV_PATH,
-        np.column_stack((t, best_speed_data)),
+        np.column_stack((t, best_speed_data, best_current_data)),
         delimiter=",",
-        header="time_s,best_axis1_speed_rpm",
+        header="time_s,best_axis1_speed_rpm,ia_axis1_a,ib_axis1_a,ic_axis1_a",
         comments="",
     )
-    plt.figure(figsize=(10, 5))
-    plt.plot(t, best_speed_data, label="轴1转速")
-    plt.axhline(y=TARGET_RPM, color="r", linestyle="--", linewidth=2, label="目标转速")
-    plt.xlabel("时间 (s)")
-    plt.ylabel("转速 (rpm)")
-    plt.title("轴1最佳参数控制下的转速响应")
-    plt.gca().text(
+    fig, (ax_speed, ax_current) = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
+    ax_speed.plot(t, best_speed_data, label="轴1转速")
+    ax_speed.axhline(y=TARGET_RPM, color="r", linestyle="--", linewidth=2, label="目标转速")
+    ax_speed.set_ylabel("转速 (rpm)")
+    ax_speed.set_title("轴1最佳参数控制下的转速和电流响应")
+    ax_speed.text(
         0.98,
         0.02,
         format_best_params_text(),
-        transform=plt.gca().transAxes,
+        transform=ax_speed.transAxes,
         va="bottom",
         ha="right",
         fontsize=8,
         bbox={"boxstyle": "round,pad=0.35", "facecolor": "white", "edgecolor": "0.55", "alpha": 0.88},
     )
-    plt.grid(True)
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(BEST_SPEED_PLOT_PATH, dpi=150)
+    ax_speed.grid(True)
+    ax_speed.legend()
+    ax_current.plot(t, best_current_data[:, 0], label="Ia")
+    ax_current.plot(t, best_current_data[:, 1], label="Ib")
+    ax_current.plot(t, best_current_data[:, 2], label="Ic")
+    ax_current.axhline(CURRENT_WARN_A, color="orange", linestyle="--", linewidth=1.0, label="电流惩罚阈值")
+    ax_current.axhline(-CURRENT_WARN_A, color="orange", linestyle="--", linewidth=1.0)
+    ax_current.set_xlabel("时间 (s)")
+    ax_current.set_ylabel("电流 (A)")
+    ax_current.grid(True)
+    ax_current.legend()
+    fig.tight_layout()
+    fig.savefig(BEST_SPEED_PLOT_PATH, dpi=150)
     print(f"Best speed data saved to: {BEST_SPEED_CSV_PATH}")
     print(f"Best speed plot saved to: {BEST_SPEED_PLOT_PATH}")
     plt.show()
