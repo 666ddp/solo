@@ -113,8 +113,8 @@ Uint16 HIL_HighOverspeedTicks_2 = 0;
 #define HIL_MOTION_TIMEOUT  (300)
 #define HIL_STARTUP_CHECK_TICKS (300)
 #define HIL_DC_DROP_CONFIRM_TICKS (100)
-// #define HIL_SPEED2_MAX_ABS_RPM (300.0f)
-// #define HIL_SPEED2_MAX_STEP_RPM (150.0f)
+#define HIL_SPEED2_MAX_ABS_RPM (300.0f)
+#define HIL_SPEED2_MAX_STEP_RPM (150.0f)
 // #define HIL_SPEED2_MAX_SPIKES (3)
 #define DUAL_AXIS2_START_INDEX (300)
 //================= PTDO 观测器专用参�?===============
@@ -1487,9 +1487,18 @@ if(Run_PMSM_2==1&&IPM_Fault_2==0)//�?
             {
                 float32 axis2_speed_rpm = _IQtoF(Speed_2) * (float32)BaseSpeed_2;
                 float32 axis2_delta_rpm = axis2_speed_rpm - HIL_LastValidSpeed_2;
-if(axis2_delta_rpm < 0.0f) axis2_delta_rpm = -axis2_delta_rpm;
-                /* HIL overspeed/reverse and axis-2 speed spike protection disabled for step experiments. */
-                HIL_LastValidSpeed_2 = axis2_speed_rpm;
+                if(axis2_delta_rpm < 0.0f) axis2_delta_rpm = -axis2_delta_rpm;
+                /* Filter one-sample axis-2 speed spikes, but do not fail the HIL run. */
+                if(axis2_speed_rpm > HIL_SPEED2_MAX_ABS_RPM ||
+                   axis2_speed_rpm < -HIL_SPEED2_MAX_ABS_RPM ||
+                   axis2_delta_rpm > HIL_SPEED2_MAX_STEP_RPM)
+                {
+                    axis2_speed_rpm = HIL_LastValidSpeed_2;
+                }
+                else
+                {
+                    HIL_LastValidSpeed_2 = axis2_speed_rpm;
+                }
                 HIL_Speed2SpikeCount = 0;
                 Speed_2 = _IQ(axis2_speed_rpm / (float32)BaseSpeed_2);
 
