@@ -77,6 +77,9 @@ Uint16 HIL_RecordLength = BO_RECORD_LENGTH;
 Uint16 HIL_CurrentStartIndex = 0;
 Uint16 HIL_CurrentEndIndex = BO_RECORD_LENGTH;
 Uint16 HIL_StepMode = 0;
+Uint16 HIL_StopRequest = 0;
+float32 HIL_HoldSpeedRef = HIL_HIGH_SPEED_REF_100;
+float32 HIL_HoldSpeedRef_2 = HIL_HIGH_SPEED_REF_100;
 char Rx_Buffer[192];
 Uint16 Rx_Index = 0;
 Uint16 Rx_LineReady = 0;  // ISR�?表示收到完整�?
@@ -864,7 +867,11 @@ if(Run_PMSM==1&&IPM_Fault==0)//初始位置定位算法
                     float32 actual_speed_rpm = _IQtoF(Speed) * (float32)BaseSpeed; // 现在 Speed 有真实数据了
                     if(Eval_State == 2 && HIL_StepMode != 0)
                     {
-                        if(HIL_StepMode == 2)
+                        if(HIL_StepMode == 4)
+                        {
+                            SpeedRef = HIL_HoldSpeedRef;
+                        }
+                        else if(HIL_StepMode == 2)
                         {
                             SpeedRef = HIL_HighStepSpeedRef(Record_Index);
                         }
@@ -877,6 +884,7 @@ if(Run_PMSM==1&&IPM_Fault==0)//初始位置定位算法
                             SpeedRef = HIL_StepSpeedRef(Record_Index);
                         }
                     }
+
                     float32 target_speed_rpm = SpeedRef * (float32)BaseSpeed;
                     float32 speed_abs_rpm;
                     float32 speed_limit_rpm = 1.2f * (float32)BaseSpeed;
@@ -931,7 +939,11 @@ if(Run_PMSM==1&&IPM_Fault==0)//初始位置定位算法
 
                       if(HIL_FailCode == 0)
                         {
-                        if(Record_Index < HIL_RecordLength)
+                        if(HIL_StepMode == 4)
+                          {
+                          Record_Index = 0;
+                          }
+                        else if(Record_Index < HIL_RecordLength)
                           {
                           Uint16 current_slot;
                           Log_Speed_x10[Record_Index] = HIL_SpeedRpmToX10(actual_speed_rpm);
@@ -1504,7 +1516,11 @@ if(Run_PMSM_2==1&&IPM_Fault_2==0)//�?
 
                 if(HIL_FailCode == 0)
                 {
-                    if(Record_Index < HIL_RecordLength)
+                    if(HIL_StepMode == 4)
+                    {
+                        Record_Index = 0;
+                    }
+                    else if(Record_Index < HIL_RecordLength)
                     {
                         Uint16 current_slot;
                         Log_Speed_x10[Record_Index] = HIL_SpeedRpmToX10(axis2_speed_rpm);
@@ -1558,7 +1574,11 @@ if(Run_PMSM_2==1&&IPM_Fault_2==0)//�?
   //=================速度环PI===================================
             if(Eval_State == 22 && HIL_StepMode != 0)
             {
-                if(HIL_StepMode == 2)
+                if(HIL_StepMode == 4)
+                {
+                    SpeedRef_2 = HIL_HoldSpeedRef_2;
+                }
+                else if(HIL_StepMode == 2)
                 {
                     SpeedRef_2 = HIL_HighStepSpeedRef(Record_Index);
                 }
@@ -1882,6 +1902,9 @@ void HIL_Poll_Rx(void)
     Uint16 j;
     Uint16 s;
     Uint16 parse_start;
+    Uint16 param_limit;
+    Uint16 param_offset;
+    Uint16 is_hold_cmd;
     float32 frac;
     Uint16 has_dot;
 
@@ -1895,7 +1918,12 @@ void HIL_Poll_Rx(void)
             {
                 Rx_Buffer[Rx_Index] = '\0';
 
-                if((Rx_Buffer[0] == 'P' && Rx_Buffer[1] == ',') ||
+                if(Rx_Buffer[0] == 'S' && Rx_Buffer[1] == 'T' && Rx_Buffer[2] == 'O' &&
+                   Rx_Buffer[3] == 'P' && Rx_Buffer[4] == '\0')
+                {
+                    HIL_StopRequest = 1;
+                }
+                else if((Rx_Buffer[0] == 'P' && Rx_Buffer[1] == ',') ||
                    (Rx_Buffer[0] == 'S' && Rx_Buffer[1] == 'T' && Rx_Buffer[2] == 'E' &&
                     Rx_Buffer[3] == 'P' && Rx_Buffer[4] == '1' && Rx_Buffer[5] == ',') ||
                    (Rx_Buffer[0] == 'H' && Rx_Buffer[1] == 'S' && Rx_Buffer[2] == 'T' &&
@@ -1903,7 +1931,9 @@ void HIL_Poll_Rx(void)
                     Rx_Buffer[6] == ',') ||
                    (Rx_Buffer[0] == 'S' && Rx_Buffer[1] == 'S' && Rx_Buffer[2] == 'T' &&
                     Rx_Buffer[3] == 'E' && Rx_Buffer[4] == 'P' && Rx_Buffer[5] == '1' &&
-                    Rx_Buffer[6] == ','))
+                    Rx_Buffer[6] == ',') ||
+                   (Rx_Buffer[0] == 'H' && Rx_Buffer[1] == 'O' && Rx_Buffer[2] == 'L' &&
+                    Rx_Buffer[3] == 'D' && Rx_Buffer[4] == '1' && Rx_Buffer[5] == ','))
                 {
                     if(Eval_State != 0)
                     {
@@ -1912,8 +1942,16 @@ void HIL_Poll_Rx(void)
                     else
                     {
                         parse_start = 2;
+                        param_limit = 11;
+                        is_hold_cmd = 0;
                         if(Rx_Buffer[0] == 'S') parse_start = 6;
                         if(Rx_Buffer[0] == 'H') parse_start = 7;
+                        if(Rx_Buffer[0] == 'H' && Rx_Buffer[1] == 'O')
+                        {
+                            parse_start = 6;
+                            param_limit = 12;
+                            is_hold_cmd = 1;
+                        }
                         if(Rx_Buffer[0] == 'S' && Rx_Buffer[1] == 'S') parse_start = 7;
                         seg = 0; ti = 0;
                         for(i = parse_start; i < 192; i++)
@@ -1931,24 +1969,29 @@ void HIL_Poll_Rx(void)
                                 }
                                 if(tmp[0] == '-') p[seg] = -p[seg];
                                 seg++; ti = 0;
-                                if(seg >= 11 || Rx_Buffer[i] == '\0') break;
+                                if(seg >= param_limit || Rx_Buffer[i] == '\0') break;
                             }
                             else { tmp[ti++] = Rx_Buffer[i]; if(ti >= 15) ti = 15; }
                         }
-                        if(seg >= 11)
+                        if(seg >= param_limit)
                         {
-                            if(p[0]  > 0.001f && p[0]  <= 1.000f)  P1  = p[0];
-                            if(p[1]  > 0.001f && p[1]  <= 1.000f)  P2  = p[1];
-                            if(p[2]  > 0.001f && p[2]  < 2000.0f)  A11 = p[2];
-                            if(p[3]  > 0.001f && p[3]  < 2000.0f)  B11 = p[3];
-                            if(p[4]  > 0.001f && p[4]  < 2000.0f)  A22 = p[4];
-                            if(p[5]  > 0.001f && p[5]  < 2000.0f)  B22 = p[5];
-                            if(p[6]  > 0.1f   && p[6]  < 2000.0f)  C3  = p[6];
-                            if(p[7]  > 0.001f && p[7]  <= 1.000f)  P3  = p[7];
-                            if(p[8]  > 0.001f && p[8]  < 2000.0f)  A33 = p[8];
-                            if(p[9]  > 0.001f && p[9]  < 2000.0f)  B33 = p[9];
-                            if(p[10] > 0.1f   && p[10] < 2000.0f)  C8  = p[10];
-                            HIL_StepMode = (Rx_Buffer[0] == 'S' && Rx_Buffer[1] == 'S') ? 3 : ((parse_start == 7) ? 2 : ((parse_start == 6) ? 1 : 0));
+                            param_offset = is_hold_cmd ? 1 : 0;
+                            if(is_hold_cmd != 0 && p[0] > 0.0f && p[0] <= 300.0f)
+                            {
+                                HIL_HoldSpeedRef = p[0] / (float32)BaseSpeed;
+                            }
+                            if(p[param_offset + 0]  > 0.001f && p[param_offset + 0]  <= 1.000f)  P1  = p[param_offset + 0];
+                            if(p[param_offset + 1]  > 0.001f && p[param_offset + 1]  <= 1.000f)  P2  = p[param_offset + 1];
+                            if(p[param_offset + 2]  > 0.001f && p[param_offset + 2]  < 2000.0f)  A11 = p[param_offset + 2];
+                            if(p[param_offset + 3]  > 0.001f && p[param_offset + 3]  < 2000.0f)  B11 = p[param_offset + 3];
+                            if(p[param_offset + 4]  > 0.001f && p[param_offset + 4]  < 2000.0f)  A22 = p[param_offset + 4];
+                            if(p[param_offset + 5]  > 0.001f && p[param_offset + 5]  < 2000.0f)  B22 = p[param_offset + 5];
+                            if(p[param_offset + 6]  > 0.1f   && p[param_offset + 6]  < 2000.0f)  C3  = p[param_offset + 6];
+                            if(p[param_offset + 7]  > 0.001f && p[param_offset + 7]  <= 1.000f)  P3  = p[param_offset + 7];
+                            if(p[param_offset + 8]  > 0.001f && p[param_offset + 8]  < 2000.0f)  A33 = p[param_offset + 8];
+                            if(p[param_offset + 9]  > 0.001f && p[param_offset + 9]  < 2000.0f)  B33 = p[param_offset + 9];
+                            if(p[param_offset + 10] > 0.1f   && p[param_offset + 10] < 2000.0f)  C8  = p[param_offset + 10];
+                            HIL_StepMode = (is_hold_cmd != 0) ? 4 : ((Rx_Buffer[0] == 'S' && Rx_Buffer[1] == 'S') ? 3 : ((parse_start == 7) ? 2 : ((parse_start == 6) ? 1 : 0)));
                             New_Params_Flag = 1;
                         }
                     }
@@ -2010,7 +2053,9 @@ void HIL_Poll_Rx(void)
                          Rx_Buffer[6] == ',') ||
                         (Rx_Buffer[0] == 'S' && Rx_Buffer[1] == 'S' && Rx_Buffer[2] == 'T' &&
                          Rx_Buffer[3] == 'E' && Rx_Buffer[4] == 'P' && Rx_Buffer[5] == '2' &&
-                         Rx_Buffer[6] == ','))
+                         Rx_Buffer[6] == ',') ||
+                   (Rx_Buffer[0] == 'H' && Rx_Buffer[1] == 'O' && Rx_Buffer[2] == 'L' &&
+                    Rx_Buffer[3] == 'D' && Rx_Buffer[4] == '2' && Rx_Buffer[5] == ','))
                 {
                     if(Eval_State != 0)
                     {
@@ -2019,8 +2064,16 @@ void HIL_Poll_Rx(void)
                     else
                     {
                         parse_start = 4;
+                        param_limit = 2;
+                        is_hold_cmd = 0;
                         if(Rx_Buffer[0] == 'S') parse_start = 6;
                         if(Rx_Buffer[0] == 'H') parse_start = 7;
+                        if(Rx_Buffer[0] == 'H' && Rx_Buffer[1] == 'O')
+                        {
+                            parse_start = 6;
+                            param_limit = 3;
+                            is_hold_cmd = 1;
+                        }
                         if(Rx_Buffer[0] == 'S' && Rx_Buffer[1] == 'S') parse_start = 7;
                         seg = 0; ti = 0;
                         for(i = parse_start; i < 192; i++)
@@ -2038,15 +2091,20 @@ void HIL_Poll_Rx(void)
                                 }
                                 if(tmp[0] == '-') p[seg] = -p[seg];
                                 seg++; ti = 0;
-                                if(seg >= 2 || Rx_Buffer[i] == '\0') break;
+                                if(seg >= param_limit || Rx_Buffer[i] == '\0') break;
                             }
                             else { tmp[ti++] = Rx_Buffer[i]; if(ti >= 15) ti = 15; }
                         }
-                        if(seg >= 2)
+                        if(seg >= param_limit)
                         {
-                            if(p[0] > 0.001f && p[0] < 200.0f) Speed_2Kp = _IQ(p[0]);
-                            if(p[1] > 0.000001f && p[1] < 1.0f) Speed_2Ki = _IQ(p[1]);
-                            HIL_StepMode = (Rx_Buffer[0] == 'S' && Rx_Buffer[1] == 'S') ? 3 : ((parse_start == 7) ? 2 : ((parse_start == 6) ? 1 : 0));
+                            param_offset = is_hold_cmd ? 1 : 0;
+                            if(is_hold_cmd != 0 && p[0] > 0.0f && p[0] <= 300.0f)
+                            {
+                                HIL_HoldSpeedRef_2 = p[0] / (float32)BaseSpeed_2;
+                            }
+                            if(p[param_offset + 0] > 0.001f && p[param_offset + 0] < 200.0f) Speed_2Kp = _IQ(p[param_offset + 0]);
+                            if(p[param_offset + 1] > 0.000001f && p[param_offset + 1] < 1.0f) Speed_2Ki = _IQ(p[param_offset + 1]);
+                            HIL_StepMode = (is_hold_cmd != 0) ? 4 : ((Rx_Buffer[0] == 'S' && Rx_Buffer[1] == 'S') ? 3 : ((parse_start == 7) ? 2 : ((parse_start == 6) ? 1 : 0)));
                             New_PI2_Params_Flag = 1;
                         }
                     }
@@ -2160,6 +2218,42 @@ void HIL_Evaluation_Task(void)
 
     HIL_Poll_Rx();
 
+    if(HIL_StopRequest != 0)
+    {
+        HIL_StopRequest = 0;
+        Run_PMSM = 2;
+        eva_close();
+        Run_PMSM_2 = 2;
+        eva_close_2();
+        DC_ON_1;
+        DC_ON2_1;
+        Record_Index = 0;
+        New_Params_Flag = 0;
+        New_PI2_Params_Flag = 0;
+        New_Dual_Params_Flag = 0;
+        Eval_State = 0;
+        HIL_RecordLength = BO_RECORD_LENGTH;
+        HIL_StepMode = 0;
+        HIL_BoostDelay = 0;
+        HIL_ForceIq = 0;
+        HIL_ForceIqPu = 0.0f;
+        HIL_MotionSeen = 0;
+        HIL_StartupCheckTicks = 0;
+        HIL_LastValidSpeed = 0.0f;
+        HIL_LastValidSpeed_2 = 0.0f;
+        HIL_Speed2SpikeCount = 0;
+        HIL_HighOverspeedTicks = 0;
+        HIL_HighOverspeedTicks_2 = 0;
+        Speed = 0;
+        Speed_2 = 0;
+        SpeedRef = 0.0f;
+        SpeedRef_2 = 0.0f;
+        Log_Spd1 = 0.0f;
+        Log_Spd2 = 0.0f;
+        TX232_String("STOPPED\n");
+        TX232_String("READY\n");
+        return;
+    }
     if(HIL_FailCode != 0)//故障处理入口
     {
         Run_PMSM = 2;
@@ -2280,7 +2374,7 @@ void HIL_Evaluation_Task(void)
         Speed_2 = 0;
         Log_Spd2 = 0.0f;
         Record_Index = 0;
-        SpeedRef_2 = HIL_TARGET_SPEED_REF;
+        SpeedRef_2 = (HIL_StepMode == 4) ? HIL_HoldSpeedRef_2 : HIL_TARGET_SPEED_REF;
         Modulation_2 = RUN_MODULATION;
         LocationFlag_2 = 1;
         Position_2 = 1;
@@ -2369,7 +2463,7 @@ void HIL_Evaluation_Task(void)
         Log_Spd1 = 0.0f;
         Log_Spd2 = 0.0f;
         SpeedRef = HIL_TARGET_SPEED_REF;
-        SpeedRef_2 = HIL_TARGET_SPEED_REF;
+        SpeedRef_2 = (HIL_StepMode == 4) ? HIL_HoldSpeedRef_2 : HIL_TARGET_SPEED_REF;
         Modulation = RUN_MODULATION;
         Modulation_2 = RUN_MODULATION;
         eva_open();
@@ -2414,7 +2508,7 @@ void HIL_Evaluation_Task(void)
         Record_Index = 0;
         HIL_LastValidSpeed = 0.0f;
         HIL_MotionSeen = 0;
-        SpeedRef = HIL_TARGET_SPEED_REF;
+        SpeedRef = (HIL_StepMode == 4) ? HIL_HoldSpeedRef : HIL_TARGET_SPEED_REF;
         Modulation = RUN_MODULATION;
         eva_open();
         Run_PMSM = 1;
@@ -2466,7 +2560,7 @@ void HIL_Evaluation_Task(void)
         Record_Index = 0;
         HIL_MotionSeen = 0;
         HIL_StartupCheckTicks = 0;
-        SpeedRef = HIL_TARGET_SPEED_REF;
+        SpeedRef = (HIL_StepMode == 4) ? HIL_HoldSpeedRef : HIL_TARGET_SPEED_REF;
         if(Dual_Mode != 0)
         {
             Eval_State = 31;
@@ -2506,7 +2600,7 @@ if(U_dc_dis <= 15)
             Position_2 = 1;
             PosCount_2 = 0;
             eva_open_2();
-            SpeedRef_2 = HIL_TARGET_SPEED_REF;
+            SpeedRef_2 = (HIL_StepMode == 4) ? HIL_HoldSpeedRef_2 : HIL_TARGET_SPEED_REF;
             Run_PMSM_2 = 1;
             SpeedLoopCount_2 = SpeedLoopPrescaler_2;
             Dual_Axis2Started = 1;
