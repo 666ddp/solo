@@ -104,7 +104,31 @@ Uint16 HIL_Speed2SpikeCount = 0;
 Uint16 HIL_HighOverspeedTicks = 0;
 Uint16 HIL_HighOverspeedTicks_2 = 0;
 
-#define HIL_TARGET_SPEED_REF (0.0267f)
+#define AXIS1_CTRL_PTSMC 1
+#define AXIS1_CTRL_PI    2
+#define AXIS1_CTRL_FTSMC 3
+Uint16 Axis1_ControlMode = AXIS1_CTRL_PTSMC;
+
+_iq Axis1_PI_Kp = _IQ(20.05826580);
+_iq Axis1_PI_Ki = _IQ(0.00090424);
+
+float32 FTSMC_K1 = 20.0f;
+float32 FTSMC_K2 = 10.0f;
+float32 FTSMC_MU = 10.0f;
+float32 FTDO_K = 20.0f;
+float32 FTDO_I = 50.0f;
+#define FTSMC_A1 (1.0f)
+#define FTSMC_A2 (1.0f)
+#define FTSMC_B1 (0.75f)
+#define FTSMC_B2 (0.75f)
+#define FTSMC_Q1 (1.25f)
+#define FTSMC_Q2 (1.25f)
+#define FTDO_A1  (1.0f)
+#define FTDO_A2  (1.0f)
+#define FTDO_B1  (0.75f)
+#define FTDO_Q1  (1.25f)
+
+#define HIL_TARGET_SPEED_REF (0.0266667f)
 #define HIL_LOG_MAX_X10 32767
 #define HIL_LOG_MIN_X10 (-32768)
 #define HIL_BOOST_IQ_PU_LOW  (0.15f)
@@ -997,28 +1021,29 @@ if(Run_PMSM==1&&IPM_Fault==0)//初始位置定位算法
                         float32 sign_sigma = (sigma > 0.0f) ? 1.0f : ((sigma < 0.0f) ? -1.0f : 0.0f);
 
                         // 【核心修�?：彻底重构边界层，消除零点附近非线性项激发的剧烈抽动�?
-                        if (abs_sigma >= PHI_SIGMA)
+                        if(Axis1_ControlMode == AXIS1_CTRL_FTSMC)
                         {
-                            // 外部非线性区
+                            float32 ftdo_sat = (abs_sigma < PHI_SIGMA) ? (sigma / PHI_SIGMA) : sign_sigma;
+                            float32 ftdo_nl = FTDO_K * (FTDO_A1 * pow(abs_sigma, FTDO_B1)
+                                           + FTDO_A2 * pow(abs_sigma, FTDO_Q1));
+                            integral_sigma += FTDO_I * ftdo_sat * T_s;
+                            d_hat = ftdo_nl * ftdo_sat + integral_sigma;
+                        }
+                        else if (abs_sigma >= PHI_SIGMA)
+                        {
                             float32 term_d1 = C6 * pow(abs_sigma, 1.0f - P3);
                             float32 term_d2 = C7 * pow(abs_sigma, 1.0f + P3);
-
-                            // 标准非线性切换项 + 积分�?
                             integral_sigma += C8 * sign_sigma * T_s;
                             d_hat = (term_d1 + term_d2) * sign_sigma + integral_sigma;
                         }
                         else
                         {
-                            // 内部线性区：误差小�?PHI_SIGMA 时，强制转为线性增益，使零点导数平滑，彻底消除抖振振荡
                             float32 d_hat_boundary = C6 * pow(PHI_SIGMA, 1.0f - P3)
                                                    + C7 * pow(PHI_SIGMA, 1.0f + P3);
-
-                            // 边界层内线性插�? 积分项软�?
                             integral_sigma += C8 * (sigma / PHI_SIGMA) * T_s;
                             d_hat = d_hat_boundary * (sigma / PHI_SIGMA) + integral_sigma;
                         }
 
-                        // 积分器抗饱和限幅
                         if(integral_sigma > 2000.0f) integral_sigma = 2000.0f;
                         if(integral_sigma < -2000.0f) integral_sigma = -2000.0f;
 
@@ -1055,7 +1080,7 @@ if(Run_PMSM==1&&IPM_Fault==0)//初始位置定位算法
             float32 f1 = term1 + term2 + term3;
 
             // 4. 更新滑模�?s = e + ∫f1 dt
-            if (Run_PMSM == 1 && IPM_Fault == 0) // 仅在启动状态下积分
+            if (Run_PMSM == 1 && IPM_Fault == 0 && Axis1_ControlMode == AXIS1_CTRL_PTSMC) // 仅在启动状态下积分
             {
                 Integral_f1 += f1 * T_s;
             }
@@ -1085,18 +1110,6 @@ if(Run_PMSM==1&&IPM_Fault==0)//初始位置定位算法
 
             // 7. 控制律合�?
             // iqref = 1/Kt * [omega_dot_ref + f1(e) + f2(s) - d_hat + B/J*omega_m]
-                float32 iq_ref_raw = omega_dot_ref + f1 + f2 - d_hat_filtered + B_J * omega_fdb;
-                float32 iq_ref_amps = KT_INV * iq_ref_raw; // 这里算出的是真实物理电流 (A)
-
-                // --- 新增：安培转标幺�?--
-                // E_Ding_DianLiu �?1.414 * 额定电流（峰值），代表标幺值的 1.0
-                float32 iq_ref_pu = iq_ref_amps / E_Ding_DianLiu;
-                // --------------------------
-
-             // 8. 限幅输出
-                if (iq_ref_pu > _IQtoF(Speed_OutMax)) iq_ref_pu = _IQtoF(Speed_OutMax);
-                if (iq_ref_pu < _IQtoF(Speed_OutMin)) iq_ref_pu = _IQtoF(Speed_OutMin);
-
                 if(HIL_ForceIq != 0)
                 {
                     Integral_f1 = 0.0f;
@@ -1107,8 +1120,50 @@ if(Run_PMSM==1&&IPM_Fault==0)//初始位置定位算法
                     IQ_Given = _IQ(HIL_ForceIqPu);
                     ID_Given = 0;
                 }
+                else if(Axis1_ControlMode == AXIS1_CTRL_PI)
+                {
+                    Speed_Ref = _IQ(SpeedRef);
+                    Speed_Fdb = Speed;
+                    Speed_Error = Speed_Ref - Speed_Fdb;
+                    Speed_Up = _IQmpy(Axis1_PI_Kp, Speed_Error);
+                    Speed_Ui = Speed_Ui + _IQmpy(Axis1_PI_Ki, Speed_Up) + _IQmpy(Axis1_PI_Ki, Speed_SatError);
+                    Speed_OutPreSat = Speed_Up + Speed_Ui;
+                    if(Speed_OutPreSat > Speed_OutMax) Speed_Out = Speed_OutMax;
+                    else if(Speed_OutPreSat < Speed_OutMin) Speed_Out = Speed_OutMin;
+                    else Speed_Out = Speed_OutPreSat;
+                    Speed_SatError = Speed_Out - Speed_OutPreSat;
+                    IQ_Given = Speed_Out;
+                }
                 else
                 {
+                    float32 iq_ref_raw;
+                    float32 iq_ref_amps;
+                    float32 iq_ref_pu;
+                    if(Axis1_ControlMode == AXIS1_CTRL_FTSMC)
+                    {
+                        float32 ft_abs_e = fabsf(e_spd);
+                        float32 ft_sign_e = (e_spd > 0.0f) ? 1.0f : ((e_spd < 0.0f) ? -1.0f : 0.0f);
+                        float32 ft_sat_e = (ft_abs_e < PHI_E) ? (e_spd / PHI_E) : ft_sign_e;
+                        float32 ft_surface_drive = FTSMC_K1 * FTSMC_A1 * ft_sat_e * pow(ft_abs_e, FTSMC_B1)
+                                                 + FTSMC_K1 * FTSMC_A2 * ft_sat_e * pow(ft_abs_e, FTSMC_Q1)
+                                                 + FTSMC_MU * ft_sat_e;
+                        f1 = ft_surface_drive;
+                        Integral_f1 += ft_surface_drive * T_s;
+                        if(Integral_f1 > 50.0f) Integral_f1 = 50.0f;
+                        if(Integral_f1 < -50.0f) Integral_f1 = -50.0f;
+                        S_smc = e_spd + Integral_f1;
+                        abs_s = fabsf(S_smc);
+                        sign_s = (S_smc > 0.0f) ? 1.0f : ((S_smc < 0.0f) ? -1.0f : 0.0f);
+                        sat_s = (abs_s < PHI_S) ? (S_smc / PHI_S) : sign_s;
+                        f2 = FTSMC_K2 * FTSMC_A1 * sat_s * pow(abs_s, FTSMC_B2)
+                           + FTSMC_K2 * FTSMC_A2 * sat_s * pow(abs_s, FTSMC_Q2)
+                           + FTSMC_MU * sat_s;
+                    }
+                    iq_ref_raw = omega_dot_ref + f1 + f2 - d_hat_filtered + B_J * omega_fdb;
+                    iq_ref_amps = KT_INV * iq_ref_raw;
+                    iq_ref_pu = iq_ref_amps / E_Ding_DianLiu;
+                    if (iq_ref_pu > _IQtoF(Speed_OutMax)) iq_ref_pu = _IQtoF(Speed_OutMax);
+                    if (iq_ref_pu < _IQtoF(Speed_OutMin)) iq_ref_pu = _IQtoF(Speed_OutMin);
                     IQ_Given = _IQ(iq_ref_pu);
                 }
 
@@ -1992,6 +2047,7 @@ void HIL_Poll_Rx(void)
                             if(p[param_offset + 9]  > 0.001f && p[param_offset + 9]  < 2000.0f)  B33 = p[param_offset + 9];
                             if(p[param_offset + 10] > 0.1f   && p[param_offset + 10] < 2000.0f)  C8  = p[param_offset + 10];
                             HIL_StepMode = (is_hold_cmd != 0) ? 4 : ((Rx_Buffer[0] == 'S' && Rx_Buffer[1] == 'S') ? 3 : ((parse_start == 7) ? 2 : ((parse_start == 6) ? 1 : 0)));
+                            Axis1_ControlMode = AXIS1_CTRL_PTSMC;
                             New_Params_Flag = 1;
                         }
                     }
@@ -1999,19 +2055,34 @@ void HIL_Poll_Rx(void)
                 else if(Rx_Buffer[0] == 'D' && Rx_Buffer[1] == 'U' && Rx_Buffer[2] == 'A' &&
                         Rx_Buffer[3] == 'L' && Rx_Buffer[4] == ',')
                 {
+                    TX232_String("SOLO_ONLY\n");
+                }
+                else if((Rx_Buffer[0] == 'F' && Rx_Buffer[1] == 'T' && Rx_Buffer[2] == '3' &&
+                         Rx_Buffer[3] == ',') ||
+                        (Rx_Buffer[0] == 'S' && Rx_Buffer[1] == 'T' && Rx_Buffer[2] == 'E' &&
+                         Rx_Buffer[3] == 'P' && Rx_Buffer[4] == '3' && Rx_Buffer[5] == ',') ||
+                        (Rx_Buffer[0] == 'H' && Rx_Buffer[1] == 'S' && Rx_Buffer[2] == 'T' &&
+                         Rx_Buffer[3] == 'E' && Rx_Buffer[4] == 'P' && Rx_Buffer[5] == '3' &&
+                         Rx_Buffer[6] == ',') ||
+                        (Rx_Buffer[0] == 'H' && Rx_Buffer[1] == 'O' && Rx_Buffer[2] == 'L' &&
+                         Rx_Buffer[3] == 'D' && Rx_Buffer[4] == '3' && Rx_Buffer[5] == ','))
+                {
                     if(Eval_State != 0)
                     {
                         TX232_String("BUSY\n");
                     }
                     else
                     {
+                        parse_start = (Rx_Buffer[0] == 'F') ? 4 : 6;
+                        if(Rx_Buffer[0] == 'H' && Rx_Buffer[1] == 'S') parse_start = 7;
+                        param_limit = (Rx_Buffer[0] == 'H' && Rx_Buffer[1] == 'O') ? 6 : 5;
+                        is_hold_cmd = (Rx_Buffer[0] == 'H' && Rx_Buffer[1] == 'O') ? 1 : 0;
                         seg = 0; ti = 0;
-                        for(i = 5; i < 192; i++)
+                        for(i = parse_start; i < 192; i++)
                         {
                             if(Rx_Buffer[i] == ',' || Rx_Buffer[i] == '\0')
                             {
-                                tmp[ti] = '\0';
-                                p[seg] = 0.0f; frac = 0.1f; has_dot = 0; s = 0;
+                                tmp[ti] = '\0'; p[seg] = 0.0f; frac = 0.1f; has_dot = 0; s = 0;
                                 if(tmp[0] == '-') { s = 1; }
                                 for(j = s; j < ti; j++)
                                 {
@@ -2021,26 +2092,22 @@ void HIL_Poll_Rx(void)
                                 }
                                 if(tmp[0] == '-') p[seg] = -p[seg];
                                 seg++; ti = 0;
-                                if(seg >= 13 || Rx_Buffer[i] == '\0') break;
+                                if(seg >= param_limit || Rx_Buffer[i] == '\0') break;
                             }
                             else { tmp[ti++] = Rx_Buffer[i]; if(ti >= 15) ti = 15; }
                         }
-                        if(seg >= 13)
+                        if(seg >= param_limit)
                         {
-                            if(p[0]  > 0.001f && p[0]  <= 1.000f)  P1  = p[0];
-                            if(p[1]  > 0.001f && p[1]  <= 1.000f)  P2  = p[1];
-                            if(p[2]  > 0.001f && p[2]  < 2000.0f)  A11 = p[2];
-                            if(p[3]  > 0.001f && p[3]  < 2000.0f)  B11 = p[3];
-                            if(p[4]  > 0.001f && p[4]  < 2000.0f)  A22 = p[4];
-                            if(p[5]  > 0.001f && p[5]  < 2000.0f)  B22 = p[5];
-                            if(p[6]  > 0.1f   && p[6]  < 2000.0f)  C3  = p[6];
-                            if(p[7]  > 0.001f && p[7]  <= 1.000f)  P3  = p[7];
-                            if(p[8]  > 0.001f && p[8]  < 2000.0f)  A33 = p[8];
-                            if(p[9]  > 0.001f && p[9]  < 2000.0f)  B33 = p[9];
-                            if(p[10] > 0.1f   && p[10] < 2000.0f)  C8  = p[10];
-                            if(p[11] > 0.001f && p[11] < 200.0f)   Speed_2Kp = _IQ(p[11]);
-                            if(p[12] > 0.000001f && p[12] < 1.0f)  Speed_2Ki = _IQ(p[12]);
-                            New_Dual_Params_Flag = 1;
+                            param_offset = is_hold_cmd ? 1 : 0;
+                            if(is_hold_cmd != 0 && p[0] > 0.0f && p[0] <= 300.0f) HIL_HoldSpeedRef = p[0] / (float32)BaseSpeed;
+                            if(p[param_offset + 0] > 0.001f && p[param_offset + 0] < 200.0f) FTSMC_K1 = p[param_offset + 0];
+                            if(p[param_offset + 1] > 0.001f && p[param_offset + 1] < 200.0f) FTSMC_K2 = p[param_offset + 1];
+                            if(p[param_offset + 2] > 0.0f && p[param_offset + 2] < 200.0f)   FTSMC_MU = p[param_offset + 2];
+                            if(p[param_offset + 3] > 0.001f && p[param_offset + 3] < 500.0f) FTDO_K = p[param_offset + 3];
+                            if(p[param_offset + 4] > 0.001f && p[param_offset + 4] < 1000.0f) FTDO_I = p[param_offset + 4];
+                            HIL_StepMode = (is_hold_cmd != 0) ? 4 : ((Rx_Buffer[0] == 'H' && Rx_Buffer[1] == 'S') ? 2 : ((Rx_Buffer[0] == 'S') ? 1 : 0));
+                            Axis1_ControlMode = AXIS1_CTRL_FTSMC;
+                            New_Params_Flag = 1;
                         }
                     }
                 }
@@ -2100,12 +2167,13 @@ void HIL_Poll_Rx(void)
                             param_offset = is_hold_cmd ? 1 : 0;
                             if(is_hold_cmd != 0 && p[0] > 0.0f && p[0] <= 300.0f)
                             {
-                                HIL_HoldSpeedRef_2 = p[0] / (float32)BaseSpeed_2;
+                                HIL_HoldSpeedRef = p[0] / (float32)BaseSpeed;
                             }
-                            if(p[param_offset + 0] > 0.001f && p[param_offset + 0] < 200.0f) Speed_2Kp = _IQ(p[param_offset + 0]);
-                            if(p[param_offset + 1] > 0.000001f && p[param_offset + 1] < 1.0f) Speed_2Ki = _IQ(p[param_offset + 1]);
+                            if(p[param_offset + 0] > 0.001f && p[param_offset + 0] < 200.0f) Axis1_PI_Kp = _IQ(p[param_offset + 0]);
+                            if(p[param_offset + 1] > 0.000001f && p[param_offset + 1] < 1.0f) Axis1_PI_Ki = _IQ(p[param_offset + 1]);
                             HIL_StepMode = (is_hold_cmd != 0) ? 4 : ((Rx_Buffer[0] == 'S' && Rx_Buffer[1] == 'S') ? 3 : ((parse_start == 7) ? 2 : ((parse_start == 6) ? 1 : 0)));
-                            New_PI2_Params_Flag = 1;
+                            Axis1_ControlMode = AXIS1_CTRL_PI;
+                            New_Params_Flag = 1;
                         }
                     }
                 }
@@ -2327,31 +2395,8 @@ void HIL_Evaluation_Task(void)
     if(New_PI2_Params_Flag == 1 && Eval_State == 0)
     {
         New_PI2_Params_Flag = 0;
-        HIL_RecordLength = (HIL_StepMode != 0) ? STEP_RECORD_LENGTH : BO_RECORD_LENGTH;
-        HIL_CurrentStartIndex = 0;
-        HIL_CurrentEndIndex = HIL_RecordLength;
-        for(clear_i = 0; clear_i < CURRENT_RECORD_LENGTH; clear_i++)
-        {
-            Log_Ia_x100[clear_i] = 0;
-            Log_Ib_x100[clear_i] = 0;
-            Log_Ic_x100[clear_i] = 0;
-        }
-        HIL_BoostDelay = 0;
-        HIL_ForceIq = 0;
-        HIL_ForceIqPu = 0.0f;
-        HIL_MotionSeen = 0;
-        HIL_StartupCheckTicks = 0;
-        HIL_DcDropTicks = 0;
-        HIL_LastValidSpeed = 0.0f;
-        HIL_LastValidSpeed_2 = 0.0f;
-        HIL_Speed2SpikeCount = 0;
-        HIL_HighOverspeedTicks = 0;
-        HIL_HighOverspeedTicks_2 = 0;
-        DC_ON2_0;
-        Pwm_EN2_0;
-        TX232_String("AK\n");
-        Eval_State = 21;
-        StartDelay = 5000;
+        Axis1_ControlMode = AXIS1_CTRL_PI;
+        New_Params_Flag = 1;
     }
 
     if(Eval_State == 21)
