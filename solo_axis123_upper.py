@@ -46,6 +46,8 @@ OSC_MEAN_ERROR_WEIGHT = 35.0
 CURRENT_WARN_A = 4.5
 CURRENT_RMS_WARN_A = 3.0
 CURRENT_HARD_A = 5.8
+STALL_CURRENT_A = 5.2
+STALL_TAIL_RPM = TARGET_RPM * 0.25
 
 BASE_DIR = Path(__file__).resolve().parent / "solo_axis123_results"
 BEST_PARAM_DIR = BASE_DIR / "best_params"
@@ -55,7 +57,7 @@ PTSMC_DEFAULT = [
     0.7674, 0.93304, 51.429, 26.385, 275.39,
 ]
 PI_DEFAULT = [20.05826580, 0.00090424]
-FTSMC_DEFAULT = [20.0, 10.0, 10.0, 20.0, 50.0]
+FTSMC_DEFAULT = [583.6, 558.9, 79.1, 8.0, 20.0]
 
 FAULT_LINES = {"RUN_FAIL", "NO_DC", "HALL_FAIL", "STALL", "DC_DROP", "USER_STOP"}
 
@@ -90,8 +92,10 @@ CONTROLLERS = {
         "high_step_cmd": "HSTEP3",
         "hold_cmd": "HOLD3",
         "params": FTSMC_DEFAULT,
-        "param_names": ["K1", "K2", "MU", "DO_K", "DO_I"],
-        "space": [(1.0, 80.0), (1.0, 80.0), (0.1, 80.0), (1.0, 120.0), (1.0, 300.0)],
+        "param_names": ["K1", "K2", "MU"],
+        "full_param_names": ["K1", "K2", "MU", "DO_K", "DO_I"],
+        "fixed_tail": [8.0, 20.0],
+        "space": [(580.0, 590.0), (530.0, 575.0), (70.0, 90.0)],
     },
 }
 
@@ -150,7 +154,9 @@ def send_stop(ser):
 def send_command_wait_ack(ser, command):
     time.sleep(PRE_SEND_QUIET)
     ser.reset_input_buffer()
-    for attempt in range(1, 7):
+    attempt = 0
+    while True:
+        attempt += 1
         ser.write(command.encode("utf-8"))
         ser.flush()
         deadline = time.time() + ACK_TIMEOUT
@@ -158,16 +164,21 @@ def send_command_wait_ack(ser, command):
             line = read_line_until(ser, deadline)
             if line is None:
                 break
+            if line in {"AK", "BUSY", "READY"} or line in FAULT_LINES:
+                print(f"RX: {line}")
             if line == "AK":
+                print("ACK received, waiting for data...")
                 return True
             if line == "BUSY":
-                raise RuntimeError("DSP busy. Send STOP first.")
+                print("DSP busy, retry after cooldown")
+                time.sleep(COOLDOWN)
+                break
             if line in FAULT_LINES:
                 raise RuntimeError(f"DSP fault before run: {line}")
             if line == "READY":
                 continue
-        print(f"No ACK, resend attempt {attempt + 1}")
-    return False
+        print(f"No ACK, retry {attempt} until ACK")
+        time.sleep(0.5)
 
 
 
@@ -230,7 +241,16 @@ def read_data(ser, record_length=RECORD_LENGTH, timeout=DATA_TIMEOUT):
     return np.asarray(speed[:record_length], dtype=float), np.asarray(current[:record_length], dtype=float)
 
 
+def command_params(ctrl, params):
+    params = list(params)
+    fixed_tail = ctrl.get("fixed_tail")
+    if fixed_tail is not None and len(params) == len(ctrl["param_names"]):
+        return params + list(fixed_tail)
+    return params
+
+
 def build_command(ctrl, mode, params, speed_rpm=None):
+    params = command_params(ctrl, params)
     params_txt = ",".join(f"{x:.8g}" for x in params)
     if mode == "bo":
         return f"{ctrl['bo_cmd']},{params_txt}\n"
@@ -245,9 +265,10 @@ def resolve_params(ctrl, params_text):
     if not params_text:
         return list(ctrl["params"])
     params = [float(x.strip()) for x in params_text.split(",") if x.strip()]
-    if len(params) != len(ctrl["params"]):
-        raise ValueError(f"{ctrl['name']} needs {len(ctrl['params'])} params, got {len(params)}")
-    return params
+    valid_lengths = {len(ctrl["params"]), len(ctrl["param_names"])}
+    if len(params) not in valid_lengths:
+        raise ValueError(f"{ctrl['name']} needs {sorted(valid_lengths)} params, got {len(params)}")
+    return command_params(ctrl, params)
 
 
 def save_best_params(path, ctrl, params, score):
@@ -256,8 +277,10 @@ def save_best_params(path, ctrl, params, score):
         w = csv.writer(f)
         w.writerow(["controller", ctrl["name"]])
         w.writerow(["score", f"{score:.8g}"])
-        w.writerow(ctrl["param_names"])
-        w.writerow([f"{x:.10g}" for x in params])
+        full_names = ctrl.get("full_param_names", ctrl["param_names"])
+        full_params = command_params(ctrl, params)
+        w.writerow(full_names)
+        w.writerow([f"{x:.10g}" for x in full_params])
 
 
 def load_best_params(ctrl_key):
@@ -280,17 +303,24 @@ def params_for_experiment(ctrl_key, params_text):
         return resolve_params(ctrl, params_text)
     best = load_best_params(ctrl_key)
     if best is not None:
-        print(f"?? {ctrl['label']} ?BO????")
+        print(f"使用 {ctrl['label']} 上次 BO 最优参数")
         return best
-    print(f"??? {ctrl['label']} ?BO???????????")
+    print(f"未找到 {ctrl['label']} BO 最优参数，使用默认参数")
     return list(ctrl["params"])
 
 
 def clear_previous_run(ser):
-    send_stop(ser)
-    time.sleep(0.5)
+    # Do not send STOP before every BO trial. STOP closes PWM/DC power in the
+    # firmware, causing the drive board to click between parameter sets.
     ser.reset_input_buffer()
     ser.reset_output_buffer()
+
+
+def cooldown_and_clear(ser, seconds):
+    deadline = time.time() + max(0.0, seconds)
+    while time.time() < deadline:
+        ser.reset_input_buffer()
+        time.sleep(min(0.2, max(0.0, deadline - time.time())))
 
 
 def remove_speed_spikes(speed_array):
@@ -363,6 +393,8 @@ def calculate_score(speed_array, current_array=None):
     }
     if current_array is not None:
         metrics["current_peak"], metrics["current_rms"], metrics["current_penalty"] = calculate_current_metrics(current_array, ignore_count)
+    if metrics["current_peak"] >= STALL_CURRENT_A and tail_mean < STALL_TAIL_RPM:
+        return FAIL_SCORE, metrics
     if tail_mean < MIN_VALID_RPM:
         return FAIL_SCORE, metrics
     rise_indices = np.flatnonzero(response >= TARGET_RPM * RISE_FRACTION)
@@ -383,7 +415,7 @@ def calculate_score(speed_array, current_array=None):
         metrics["rise_time"] * 4000.0
         + metrics["settling_time"] * 1800.0
         + overshoot * 500.0
-        + steady_error * 50.0
+        + steady_error * 650.0
         + ripple * 8.0
         + steady_itae * 0.5
         + metrics["osc_penalty"]
@@ -474,12 +506,12 @@ def plot_best_improvements(ax, rounds, plot_best, improved):
         return
     improved_rounds = rounds[improved]
     improved_scores = plot_best[improved]
-    ax.plot(improved_rounds, improved_scores, color="goldenrod", linewidth=2.0, label="??????")
+    ax.plot(improved_rounds, improved_scores, color="goldenrod", linewidth=2.0, label="历史最优")
     last_round = improved_rounds[-1]
     last_score = improved_scores[-1]
     if last_round < rounds[-1]:
         ax.plot([last_round, rounds[-1]], [last_score, last_score], color="goldenrod", linewidth=2.0, label="_nolegend_")
-    ax.scatter(improved_rounds, improved_scores, marker="o", s=70, facecolor="yellow", edgecolor="goldenrod", linewidths=1.5, label="?????", zorder=4)
+    ax.scatter(improved_rounds, improved_scores, marker="o", s=70, facecolor="yellow", edgecolor="goldenrod", linewidths=1.5, label="刷新最优", zorder=4)
 
 
 def save_score_plot(log_path, out_dir, improved_history=None):
@@ -508,10 +540,10 @@ def save_score_plot(log_path, out_dir, improved_history=None):
     if improved_history is None:
         improved_history = np.r_[True, np.diff(plot_best) < 0]
     fig, ax = plt.subplots(figsize=(10, 5))
-    ax.plot(rounds, plot_scores, marker="o", linewidth=1.5, label="????")
+    ax.plot(rounds, plot_scores, marker="o", linewidth=1.5, label="本轮得分")
     plot_best_improvements(ax, rounds, plot_best, improved_history)
     ax.set_xlabel("??")
-    ax.set_ylabel("??????")
+    ax.set_ylabel("目标函数得分")
     ax.grid(True)
     ax.legend()
     fig.tight_layout()
@@ -561,7 +593,7 @@ def run_hold(args):
     params = params_for_experiment(args.controller, args.params)
     with serial.Serial(args.port, BAUD_RATE, timeout=0.05) as ser:
         run_once(ser, args.controller, "hold", params, args.target)
-    print(f"?????? {args.target:g} rpm???????????????????? stop?")
+    print(f"已进入 {args.target:g} rpm 保持运行，电机会持续转动；需要停止请运行 stop。")
 
 
 def run_stop(args):
@@ -619,7 +651,7 @@ def run_bo(args):
                     f"Irms={metrics['current_rms']:.2f}A"
                 )
                 if score < best["score"]:
-                    best.update(score=score, params=list(params), speed=speed.copy(), current=current.copy())
+                    best.update(score=score, params=command_params(ctrl, params), speed=speed.copy(), current=current.copy())
                     improved = True
                     save_bo_waveform(out, "best_params_waveform", speed, current, args.controller)
                     save_best_params(out / "best_params.csv", ctrl, params, score)
@@ -642,7 +674,7 @@ def run_bo(args):
             improved_history.append(improved)
             save_score_plot(log_path, out, improved_history)
             print(f"Cooldown {args.cooldown:.0f}s")
-            time.sleep(args.cooldown)
+            cooldown_and_clear(ser, args.cooldown)
             return score
 
         res = gp_minimize(
@@ -661,26 +693,65 @@ def run_bo(args):
     print("Best waveform plot saved to:", out / "best_params_waveform.png")
 
 
+
 def ask_choice(title, options):
-    print(f"\n{title}")
-    for i, (key, label) in enumerate(options, start=1):
-        print(f"{i}. {label}")
+    try:
+        import msvcrt
+    except Exception:
+        msvcrt = None
+
+    if msvcrt is None:
+        print(f"\n{title}")
+        for i, (key, label) in enumerate(options, start=1):
+            print(f"{i}. {label}")
+        while True:
+            value = input("\u8bf7\u8f93\u5165\u5e8f\u53f7: ").strip()
+            if value.isdigit() and 1 <= int(value) <= len(options):
+                return options[int(value) - 1][0]
+            print("\u8f93\u5165\u65e0\u6548\uff0c\u8bf7\u91cd\u65b0\u9009\u62e9\u3002")
+
+    idx = 0
+
+    def redraw():
+        print("\033[2J\033[H", end="")
+        print(title)
+        print("\u4f7f\u7528 \u2191/\u2193 \u6216 W/S \u9009\u62e9\uff0cEnter \u786e\u8ba4\uff1b\u4e5f\u53ef\u4ee5\u76f4\u63a5\u6309\u6570\u5b57\u3002")
+        print()
+        for i, (_, label) in enumerate(options):
+            prefix = "> " if i == idx else "  "
+            print(f"{prefix}{i + 1}. {label}")
+
+    redraw()
     while True:
-        value = input("?????: ").strip()
-        if value.isdigit() and 1 <= int(value) <= len(options):
-            return options[int(value) - 1][0]
-        print("???????????")
-
-
-def ask_int(prompt, default):
-    value = input(f"{prompt} [{default}]: ").strip()
-    return default if value == "" else int(value)
+        ch = msvcrt.getwch()
+        if ch in ("\r", "\n"):
+            print()
+            return options[idx][0]
+        if ch.isdigit():
+            n = int(ch)
+            if 1 <= n <= len(options):
+                print()
+                return options[n - 1][0]
+        if ch in ("w", "W"):
+            idx = (idx - 1) % len(options)
+            redraw()
+        elif ch in ("s", "S"):
+            idx = (idx + 1) % len(options)
+            redraw()
+        elif ch in ("\x00", "\xe0"):
+            code = msvcrt.getwch()
+            if code == "H":
+                idx = (idx - 1) % len(options)
+                redraw()
+            elif code == "P":
+                idx = (idx + 1) % len(options)
+                redraw()
 
 
 def choose_hold_speed():
     return ask_choice(
-        "???????????",
-        [(100.0, "100 rpm??"), (200.0, "200 rpm??")],
+        "\u8bf7\u9009\u62e9\u4fdd\u6301\u8f6c\u901f",
+        [(100.0, "100 rpm \u4fdd\u6301"), (200.0, "200 rpm \u4fdd\u6301")],
     )
 
 
@@ -697,22 +768,20 @@ def fill_interactive_args(args):
         return args
 
     args.controller = ask_choice(
-        "??????",
+        "\u8bf7\u9009\u62e9\u63a7\u5236\u5668",
         [(key, CONTROLLERS[key]["label"]) for key in ["pi", "ftsmc", "ptsmc"]],
     )
     args.mode = ask_choice(
-        "???????",
+        "\u8bf7\u9009\u62e9\u8fd0\u884c\u6a21\u5f0f",
         [
-            ("bo", "BO?????0-80 rpm?"),
-            ("step", "?????0-100-200 rpm?"),
-            ("hold", "???????????????????"),
-            ("stop", "????"),
+            ("bo", "BO \u53c2\u6570\u4f18\u5316\uff080-80 rpm\uff09"),
+            ("step", "\u9636\u8dc3\u5b9e\u9a8c\uff080-100-200 rpm\uff09"),
+            ("hold", "\u4fdd\u6301\u6307\u5b9a\u8f6c\u901f\u8fd0\u884c"),
+            ("stop", "\u505c\u6b62\u7535\u673a"),
         ],
     )
     if args.mode == "bo":
         args.target = 80.0
-        args.calls = ask_int("BO????", args.calls)
-        args.initial = ask_int("??????", args.initial)
     elif args.mode == "step":
         args.target = 200.0
     elif args.mode == "hold":
@@ -727,7 +796,7 @@ def main():
     p.add_argument("--controller", choices=sorted(CONTROLLER_ALIASES), default="ptsmc")
     p.add_argument("--port", default=DSP_PORT)
     p.add_argument("--target", type=float, default=None)
-    p.add_argument("--params", help="????????????/????????????BO????")
+    p.add_argument("--params", help="手动指定参数，逗号分隔；不填则优先使用 BO 最优参数")
     p.add_argument("--calls", type=int, default=40)
     p.add_argument("--initial", type=int, default=15)
     p.add_argument("--cooldown", type=float, default=COOLDOWN)
