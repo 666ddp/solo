@@ -1190,7 +1190,7 @@ if(Run_PMSM==1&&IPM_Fault==0)//初始位置定位算法
                     }
                     if(Axis1_ControlMode == AXIS1_CTRL_FTSMC)
                     {
-                        iq_ref_raw = omega_dot_ref + f1 + f2 + B_J * omega_fdb;
+                        iq_ref_raw = omega_dot_ref + f1 + f2 - d_hat_filtered + B_J * omega_fdb;
                     }
                     else
                     {

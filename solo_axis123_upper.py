@@ -57,7 +57,7 @@ PTSMC_DEFAULT = [
     0.7674, 0.93304, 51.429, 26.385, 275.39,
 ]
 PI_DEFAULT = [20.05826580, 0.00090424]
-FTSMC_DEFAULT = [583.6, 558.9, 79.1, 8.0, 20.0]
+FTSMC_DEFAULT = [583.6, 558.9, 79.1, 4.0, 10.0]
 
 FAULT_LINES = {"RUN_FAIL", "NO_DC", "HALL_FAIL", "STALL", "DC_DROP", "USER_STOP"}
 
@@ -92,10 +92,8 @@ CONTROLLERS = {
         "high_step_cmd": "HSTEP3",
         "hold_cmd": "HOLD3",
         "params": FTSMC_DEFAULT,
-        "param_names": ["K1", "K2", "MU"],
-        "full_param_names": ["K1", "K2", "MU", "DO_K", "DO_I"],
-        "fixed_tail": [8.0, 20.0],
-        "space": [(580.0, 590.0), (530.0, 575.0), (70.0, 90.0)],
+        "param_names": ["K1", "K2", "MU", "DO_K", "DO_I"],
+        "space": [(580.0, 590.0), (530.0, 575.0), (70.0, 90.0), (1.0, 8.0), (1.0, 20.0)],
     },
 }
 
