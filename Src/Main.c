@@ -115,18 +115,18 @@ _iq Axis1_PI_Ki = _IQ(0.00090424);
 float32 FTSMC_K1 = 20.0f;
 float32 FTSMC_K2 = 10.0f;
 float32 FTSMC_MU = 10.0f;
-float32 FTDO_K = 20.0f;
-float32 FTDO_I = 50.0f;
+float32 FTDO_K = 80.0f;
+float32 FTDO_I = 100.0f;
 #define FTSMC_A1 (1.0f)
 #define FTSMC_A2 (1.0f)
 #define FTSMC_B1 (0.75f)
 #define FTSMC_B2 (0.75f)
-#define FTSMC_Q1 (1.25f)
-#define FTSMC_Q2 (1.25f)
+#define FTSMC_Q1 (1.1f)
+#define FTSMC_Q2 (1.1f)
 #define FTDO_A1  (1.0f)
 #define FTDO_A2  (1.0f)
 #define FTDO_B1  (0.75f)
-#define FTDO_Q1  (1.25f)
+#define FTDO_Q1  (1.1f)
 
 #define HIL_TARGET_SPEED_REF (0.0266667f)
 #define HIL_LOG_MAX_X10 32767
@@ -176,6 +176,7 @@ float32 HIL_SafeStepSpeedRef(Uint16 index);
 int16 HIL_CurrentAToX100(float32 current_a);
 void HIL_AppendFloat2(char *buf, Uint16 *idx, float32 val);
 void HIL_ResetAxis1RunState(void);
+void HIL_ClearRunResidue(void);
 Uint16 HIL_CurrentLogSlot(Uint16 index, Uint16 *slot);
 
 static int16 HIL_SpeedRpmToX10(float32 speed_rpm)
@@ -590,6 +591,68 @@ void HIL_ResetAxis1RunState(void)
     Tb = 0;
     Tc = 0;
     Sector = 0;
+}
+
+void HIL_ClearRunResidue(void)
+{
+    Uint16 i;
+
+    Record_Index = 0;
+    HIL_RecordLength = BO_RECORD_LENGTH;
+    HIL_CurrentStartIndex = 0;
+    HIL_CurrentEndIndex = BO_RECORD_LENGTH;
+    HIL_StepMode = 0;
+    HIL_StopRequest = 0;
+    New_Params_Flag = 0;
+    New_PI2_Params_Flag = 0;
+    New_Dual_Params_Flag = 0;
+    Eval_State = 0;
+    ActiveAxis = 1;
+    StartDelay = 0;
+    HIL_FailCode = 0;
+    HIL_BoostDelay = 0;
+    HIL_ForceIq = 0;
+    HIL_ForceIqPu = 0.0f;
+    HIL_MotionSeen = 0;
+    HIL_StartupCheckTicks = 0;
+    HIL_DcDropTicks = 0;
+    Dual_Axis2Started = 0;
+    Dual_Mode = 0;
+    HIL_LastValidSpeed = 0.0f;
+    HIL_LastValidSpeed_2 = 0.0f;
+    HIL_Speed2SpikeCount = 0;
+    HIL_HighOverspeedTicks = 0;
+    HIL_HighOverspeedTicks_2 = 0;
+    HIL_HoldSpeedRef = HIL_HIGH_SPEED_REF_100;
+    HIL_HoldSpeedRef_2 = HIL_HIGH_SPEED_REF_100;
+
+    HIL_ResetAxis1RunState();
+
+    Speed_2Ui = 0;
+    IQ_2Ui = 0;
+    ID_2Ui = 0;
+    IQ_2Given = 0;
+    ID_2Given = 0;
+    Speed_2run = 0;
+    Speed_2 = 0;
+    SpeedRef_2 = 0.0f;
+    Log_Spd2 = 0.0f;
+    SpeedLoopCount_2 = SpeedLoopPrescaler_2;
+
+    for(i = 0; i < RECORD_LENGTH; i++)
+    {
+        Log_Speed_x10[i] = 0;
+    }
+    for(i = 0; i < DUAL_RECORD_LENGTH; i++)
+    {
+        Log_Speed_2_x10[i] = 0;
+    }
+    for(i = 0; i < CURRENT_RECORD_LENGTH; i++)
+    {
+        Log_Ia_x100[i] = 0;
+        Log_Ib_x100[i] = 0;
+        Log_Ic_x100[i] = 0;
+    }
 }
 //===================================================================
 Uint16 Run_PMSM=2;
@@ -2014,6 +2077,25 @@ void HIL_Poll_Rx(void)
                 {
                     HIL_StopRequest = 1;
                 }
+                else if(Rx_Buffer[0] == 'C' && Rx_Buffer[1] == 'L' && Rx_Buffer[2] == 'R' &&
+                        Rx_Buffer[3] == '\0')
+                {
+                    if(Eval_State != 0)
+                    {
+                        TX232_String("BUSY\n");
+                    }
+                    else
+                    {
+                        Run_PMSM = 2;
+                        eva_close();
+                        Run_PMSM_2 = 2;
+                        eva_close_2();
+                        HIL_ClearRunResidue();
+                        while(ScibRegs.SCIFFRX.bit.RXFFST > 0) { ScibRegs.SCIRXBUF.all; }
+                        TX232_String("CLEARED\n");
+                        TX232_String("READY\n");
+                    }
+                }
                 else if((Rx_Buffer[0] == 'P' && Rx_Buffer[1] == ',') ||
                    (Rx_Buffer[0] == 'S' && Rx_Buffer[1] == 'T' && Rx_Buffer[2] == 'E' &&
                     Rx_Buffer[3] == 'P' && Rx_Buffer[4] == '1' && Rx_Buffer[5] == ',') ||
@@ -2331,20 +2413,7 @@ void HIL_Evaluation_Task(void)
         eva_close_2();
         DC_ON_1;
         DC_ON2_1;
-        Record_Index = 0;
-        New_Params_Flag = 0;
-        New_PI2_Params_Flag = 0;
-        New_Dual_Params_Flag = 0;
-        Eval_State = 0;
-        HIL_RecordLength = BO_RECORD_LENGTH;
-        HIL_StepMode = 0;
-        HIL_ResetAxis1RunState();
-        HIL_LastValidSpeed_2 = 0.0f;
-        HIL_Speed2SpikeCount = 0;
-        HIL_HighOverspeedTicks_2 = 0;
-        Speed_2 = 0;
-        SpeedRef_2 = 0.0f;
-        Log_Spd2 = 0.0f;
+        HIL_ClearRunResidue();
         TX232_String("STOPPED\n");
         TX232_String("READY\n");
         return;
@@ -2357,19 +2426,6 @@ void HIL_Evaluation_Task(void)
         eva_close_2();
         DC_ON_1;
         DC_ON2_1;
-        Record_Index = 0;
-        New_Params_Flag = 0;
-        New_PI2_Params_Flag = 0;
-        New_Dual_Params_Flag = 0;
-        Eval_State = 0;
-        HIL_RecordLength = BO_RECORD_LENGTH;
-        HIL_StepMode = 0;
-        HIL_ResetAxis1RunState();
-        HIL_LastValidSpeed_2 = 0.0f;
-        HIL_Speed2SpikeCount = 0;
-        HIL_HighOverspeedTicks_2 = 0;
-        Speed_2 = 0;
-        Log_Spd2 = 0.0f;
 
         if(HIL_FailCode == 1) TX232_String("RUN_FAIL\n");
         else if(HIL_FailCode == 2) TX232_String("NO_DC\n");
@@ -2378,7 +2434,7 @@ void HIL_Evaluation_Task(void)
         else if(HIL_FailCode == 5) TX232_String("DC_DROP\n");
         else if(HIL_FailCode == 6) TX232_String("USER_STOP\n");
 
-        HIL_FailCode = 0;
+        HIL_ClearRunResidue();
         TX232_String("READY\n");
         return;
     }
@@ -2389,6 +2445,14 @@ void HIL_Evaluation_Task(void)
         HIL_RecordLength = (HIL_StepMode != 0) ? STEP_RECORD_LENGTH : BO_RECORD_LENGTH;
         HIL_CurrentStartIndex = 0;
         HIL_CurrentEndIndex = HIL_RecordLength;
+        for(clear_i = 0; clear_i < RECORD_LENGTH; clear_i++)
+        {
+            Log_Speed_x10[clear_i] = 0;
+        }
+        for(clear_i = 0; clear_i < DUAL_RECORD_LENGTH; clear_i++)
+        {
+            Log_Speed_2_x10[clear_i] = 0;
+        }
         for(clear_i = 0; clear_i < CURRENT_RECORD_LENGTH; clear_i++)
         {
             Log_Ia_x100[clear_i] = 0;
