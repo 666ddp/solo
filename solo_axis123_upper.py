@@ -1,4 +1,4 @@
-import argparse
+﻿import argparse
 import csv
 import time
 from dataclasses import dataclass
@@ -21,6 +21,7 @@ BAUD_RATE = 115200
 DT = 0.001
 RECORD_LENGTH = 1000
 STEP_RECORD_LENGTH = 4000
+HOLD_RECORD_LENGTH = STEP_RECORD_LENGTH
 STEP1_END_INDEX = 1000
 STEP2_END_INDEX = 2500
 TARGET_RPM = 80.0
@@ -28,10 +29,12 @@ COOLDOWN = 10.0
 ACK_TIMEOUT = 6.0
 DATA_TIMEOUT = 15.0
 STEP_DATA_TIMEOUT = 30.0
+HOLD_DATA_TIMEOUT = 90.0
 POST_DATA_READY_TIMEOUT = 3.0
 PRE_SEND_QUIET = 1.5
+CLEAR_TIMEOUT = 4.0
 FAIL_SCORE = 200000.0
-MIN_VALID_RPM = TARGET_RPM * 0.75
+MIN_VALID_RPM = TARGET_RPM * 0.90
 TAIL_FRACTION = 0.50
 STARTUP_IGNORE_TIME = 0.0
 RISE_FRACTION = 0.90
@@ -43,6 +46,12 @@ OSC_EVAL_FRACTION = 0.90
 OSC_STD_WEIGHT = 120.0
 OSC_RANGE_WEIGHT = 20.0
 OSC_MEAN_ERROR_WEIGHT = 35.0
+STEADY_ERROR_WEIGHT = 1200.0
+OVERSHOOT_WEIGHT = 1100.0
+POST_RISE_DELAY = 0.05
+POST_RISE_WINDOW = 0.50
+POST_RISE_STD_WEIGHT = 180.0
+POST_RISE_RANGE_WEIGHT = 55.0
 CURRENT_WARN_A = 4.5
 CURRENT_RMS_WARN_A = 3.0
 CURRENT_HARD_A = 5.8
@@ -53,11 +62,11 @@ BASE_DIR = Path(__file__).resolve().parent / "solo_axis123_results"
 BEST_PARAM_DIR = BASE_DIR / "best_params"
 
 PTSMC_DEFAULT = [
-    0.94834, 0.42657, 142.38, 0.59725, 91.208, 315.0,
-    0.7674, 0.93304, 51.429, 26.385, 275.39,
+    0.999, 0.3, 80.0, 0.001, 130.0, 401.5037825,
+    1.169076663, 0.9, 40.0, 39.99932264, 700.0,
 ]
 PI_DEFAULT = [20.05826580, 0.00090424]
-FTSMC_DEFAULT = [583.6, 558.9, 79.1, 4.0, 10.0]
+FTSMC_DEFAULT = [517.800646, 616.1140106, 96.82640409, 8.463657968, 18.9723662]
 
 FAULT_LINES = {"RUN_FAIL", "NO_DC", "HALL_FAIL", "STALL", "DC_DROP", "USER_STOP"}
 
@@ -93,7 +102,7 @@ CONTROLLERS = {
         "hold_cmd": "HOLD3",
         "params": FTSMC_DEFAULT,
         "param_names": ["K1", "K2", "MU", "DO_K", "DO_I"],
-        "space": [(580.0, 590.0), (530.0, 575.0), (70.0, 90.0), (1.0, 8.0), (1.0, 20.0)],
+        "space": [(500.0, 650.0), (480.0, 650.0), (60.0, 100.0), (1.0, 10.0), (3.0, 30.0)],
     },
 }
 
@@ -149,6 +158,35 @@ def send_stop(ser):
     return False
 
 
+def send_clear(ser):
+    ser.reset_input_buffer()
+    ser.reset_output_buffer()
+    ser.write(b"CLR\n")
+    ser.flush()
+    deadline = time.time() + CLEAR_TIMEOUT
+    saw_cleared = False
+    while time.time() < deadline:
+        line = read_line_until(ser, deadline)
+        if line is None:
+            break
+        if line == "READY" and saw_cleared:
+            ser.reset_input_buffer()
+            return True
+        if line in {"STOPPED", "READY"}:
+            continue
+        if line == "CLEARED":
+            saw_cleared = True
+            continue
+        if line == "BUSY":
+            return False
+        if line in FAULT_LINES:
+            raise RuntimeError(f"DSP fault during clear: {line}")
+    if not saw_cleared:
+        raise RuntimeError("DSP clear timeout; please flash firmware with CLR support")
+    ser.reset_input_buffer()
+    return True
+
+
 def send_command_wait_ack(ser, command):
     time.sleep(PRE_SEND_QUIET)
     ser.reset_input_buffer()
@@ -197,7 +235,10 @@ def wait_for_ready_after_data(ser):
 def read_data(ser, record_length=RECORD_LENGTH, timeout=DATA_TIMEOUT):
     speed = []
     current = []
+    observer = []
     saw_data_end = False
+    wait_started = time.time()
+    last_notice = wait_started
     deadline = time.time() + timeout
     while time.time() < deadline:
         line = read_line_until(ser, deadline)
@@ -207,7 +248,13 @@ def read_data(ser, record_length=RECORD_LENGTH, timeout=DATA_TIMEOUT):
             raise RuntimeError(f"DSP fault during run: {line}")
         if line == "DATA_START":
             break
+        now = time.time()
+        if now - last_notice >= 2.0:
+            print(f"Waiting DATA_START... {now - wait_started:.0f}s elapsed")
+            last_notice = now
     else:
+        raise RuntimeError("DATA_START timeout")
+    if not line or line != "DATA_START":
         raise RuntimeError("DATA_START timeout")
 
     deadline = time.time() + timeout
@@ -224,8 +271,13 @@ def read_data(ser, record_length=RECORD_LENGTH, timeout=DATA_TIMEOUT):
                 speed.append(float(parts[0]))
                 if len(parts) >= 4:
                     current.append([float(parts[1]), float(parts[2]), float(parts[3])])
+                    observer.append(float(parts[4]) if len(parts) >= 5 else 0.0)
+                elif len(parts) >= 2:
+                    current.append([0.0, 0.0, 0.0])
+                    observer.append(float(parts[1]))
                 else:
                     current.append([0.0, 0.0, 0.0])
+                    observer.append(0.0)
         except (ValueError, IndexError):
             continue
 
@@ -236,7 +288,12 @@ def read_data(ser, record_length=RECORD_LENGTH, timeout=DATA_TIMEOUT):
     if len(speed) < record_length:
         speed.extend([speed[-1]] * (record_length - len(speed)))
         current.extend([current[-1]] * (record_length - len(current)))
-    return np.asarray(speed[:record_length], dtype=float), np.asarray(current[:record_length], dtype=float)
+        observer.extend([observer[-1] if observer else 0.0] * (record_length - len(observer)))
+    return (
+        np.asarray(speed[:record_length], dtype=float),
+        np.asarray(current[:record_length], dtype=float),
+        np.asarray(observer[:record_length], dtype=float),
+    )
 
 
 def command_params(ctrl, params):
@@ -281,6 +338,26 @@ def save_best_params(path, ctrl, params, score):
         w.writerow([f"{x:.10g}" for x in full_params])
 
 
+def append_csv_row_with_retry(path, row, retries=8, delay=0.25):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    for attempt in range(retries):
+        try:
+            with path.open("a", newline="", encoding="utf-8") as f:
+                csv.writer(f).writerow(row)
+            return path
+        except PermissionError:
+            if attempt < retries - 1:
+                time.sleep(delay)
+                continue
+            break
+
+    fallback = path.with_name(f"{path.stem}_fallback{path.suffix}")
+    with fallback.open("a", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerow(row)
+    print(f"Warning: {path.name} is locked; wrote row to {fallback.name}")
+    return fallback
+
+
 def load_best_params(ctrl_key):
     ctrl = CONTROLLERS[ctrl_key]
     path = BEST_PARAM_DIR / f"{ctrl_key}_best_params.csv"
@@ -308,10 +385,11 @@ def params_for_experiment(ctrl_key, params_text):
 
 
 def clear_previous_run(ser):
-    # Do not send STOP before every BO trial. STOP closes PWM/DC power in the
-    # firmware, causing the drive board to click between parameter sets.
-    ser.reset_input_buffer()
-    ser.reset_output_buffer()
+    if not send_clear(ser):
+        print("DSP busy before run; wait and retry clear")
+        time.sleep(COOLDOWN)
+        if not send_clear(ser):
+            raise RuntimeError("DSP is still busy before run")
 
 
 def cooldown_and_clear(ser, seconds):
@@ -385,6 +463,9 @@ def calculate_score(speed_array, current_array=None):
         "osc_range": osc_range,
         "osc_mean_error": osc_mean_error,
         "osc_penalty": osc_penalty,
+        "post_rise_std": 0.0,
+        "post_rise_range": 0.0,
+        "post_rise_penalty": 0.0,
         "current_peak": 0.0,
         "current_rms": 0.0,
         "current_penalty": 0.0,
@@ -397,7 +478,18 @@ def calculate_score(speed_array, current_array=None):
         return FAIL_SCORE, metrics
     rise_indices = np.flatnonzero(response >= TARGET_RPM * RISE_FRACTION)
     if len(rise_indices) > 0:
-        metrics["rise_time"] = float(rise_indices[0] * DT)
+        rise_index = int(rise_indices[0])
+        metrics["rise_time"] = float(rise_index * DT)
+        post_start = min(len(response), rise_index + int(POST_RISE_DELAY / DT))
+        post_end = min(len(response), post_start + int(POST_RISE_WINDOW / DT))
+        if post_end > post_start + 5:
+            post_rise_data = response[post_start:post_end]
+            metrics["post_rise_std"] = float(np.std(post_rise_data))
+            metrics["post_rise_range"] = float(np.max(post_rise_data) - np.min(post_rise_data))
+            metrics["post_rise_penalty"] = (
+                metrics["post_rise_std"] * POST_RISE_STD_WEIGHT
+                + metrics["post_rise_range"] * POST_RISE_RANGE_WEIGHT
+            )
     band = TARGET_RPM * SETTLING_BAND
     outside = np.flatnonzero(np.abs(response - TARGET_RPM) > band)
     if len(outside) == 0:
@@ -412,11 +504,12 @@ def calculate_score(speed_array, current_array=None):
     score = (
         metrics["rise_time"] * 4000.0
         + metrics["settling_time"] * 1800.0
-        + overshoot * 500.0
-        + steady_error * 650.0
+        + overshoot * OVERSHOOT_WEIGHT
+        + steady_error * STEADY_ERROR_WEIGHT
         + ripple * 8.0
         + steady_itae * 0.5
         + metrics["osc_penalty"]
+        + metrics["post_rise_penalty"]
         + metrics["current_penalty"]
     )
     return score, metrics
@@ -430,17 +523,18 @@ def reference_profile():
     return ref
 
 
-def save_step_run(out_dir, prefix, speed, current, label):
+def save_step_run(out_dir, prefix, speed, current, label, observer=None):
     out_dir.mkdir(parents=True, exist_ok=True)
     t = np.arange(STEP_RECORD_LENGTH, dtype=float) * DT
     ref = reference_profile()
+    observer = np.zeros(len(speed), dtype=float) if observer is None else np.asarray(observer, dtype=float)
     csv_path = out_dir / f"{prefix}.csv"
     plot_path = out_dir / f"{prefix}.png"
     np.savetxt(
         csv_path,
-        np.column_stack((t, ref, speed, current)),
+        np.column_stack((t, ref, speed, observer)),
         delimiter=",",
-        header=f"time_s,target_rpm,{label}_speed_rpm,ia_a,ib_a,ic_a",
+        header=f"time_s,target_rpm,{label}_speed_rpm,d_hat_filtered",
         comments="",
     )
     fig, (ax_speed, ax_current) = plt.subplots(2, 1, figsize=(12, 7), sharex=True)
@@ -467,22 +561,14 @@ def save_step_run(out_dir, prefix, speed, current, label):
     return csv_path, plot_path
 
 
-def save_bo_waveform(out_dir, prefix, speed, current, label):
-    out_dir.mkdir(parents=True, exist_ok=True)
+def plot_waveform(speed, current, label, target_rpm=TARGET_RPM, title=None):
     t = np.arange(len(speed), dtype=float) * DT
-    csv_path = out_dir / f"{prefix}.csv"
-    plot_path = out_dir / f"{prefix}.png"
-    np.savetxt(
-        csv_path,
-        np.column_stack((t, speed, current)),
-        delimiter=",",
-        header=f"time_s,{label}_speed_rpm,ia_a,ib_a,ic_a",
-        comments="",
-    )
     fig, (ax_speed, ax_current) = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
     ax_speed.plot(t, speed, label=f"{label} speed")
-    ax_speed.axhline(TARGET_RPM, color="r", linestyle="--", label="target")
+    ax_speed.axhline(target_rpm, color="r", linestyle="--", label="target")
     ax_speed.set_ylabel("Speed (rpm)")
+    if title:
+        ax_speed.set_title(title)
     ax_speed.grid(True)
     ax_speed.legend()
     ax_current.plot(t, current[:, 0], label="Ia")
@@ -493,6 +579,23 @@ def save_bo_waveform(out_dir, prefix, speed, current, label):
     ax_current.grid(True)
     ax_current.legend()
     fig.tight_layout()
+    return fig
+
+
+def save_bo_waveform(out_dir, prefix, speed, current, label, target_rpm=TARGET_RPM, observer=None):
+    out_dir.mkdir(parents=True, exist_ok=True)
+    t = np.arange(len(speed), dtype=float) * DT
+    observer = np.zeros(len(speed), dtype=float) if observer is None else np.asarray(observer, dtype=float)
+    csv_path = out_dir / f"{prefix}.csv"
+    plot_path = out_dir / f"{prefix}.png"
+    np.savetxt(
+        csv_path,
+        np.column_stack((t, speed, observer)),
+        delimiter=",",
+        header=f"time_s,{label}_speed_rpm,d_hat_filtered",
+        comments="",
+    )
+    fig = plot_waveform(speed, current, label, target_rpm=target_rpm)
     fig.savefig(plot_path, dpi=150)
     plt.close(fig)
     return csv_path, plot_path
@@ -517,14 +620,18 @@ def save_score_plot(log_path, out_dir, improved_history=None):
     scores = []
     if not log_path.exists():
         return None
-    with log_path.open("r", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            try:
-                trials.append(int(float(row["trial"])))
-                scores.append(float(row["score"]))
-            except Exception:
-                pass
+    try:
+        with log_path.open("r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                try:
+                    trials.append(int(float(row["trial"])))
+                    scores.append(float(row["score"]))
+                except Exception:
+                    pass
+    except PermissionError:
+        print(f"Warning: {log_path.name} is locked; skipped score plot update")
+        return None
     if not trials:
         return None
     rounds = np.asarray(trials, dtype=int)
@@ -540,7 +647,7 @@ def save_score_plot(log_path, out_dir, improved_history=None):
     fig, ax = plt.subplots(figsize=(10, 5))
     ax.plot(rounds, plot_scores, marker="o", linewidth=1.5, label="本轮得分")
     plot_best_improvements(ax, rounds, plot_best, improved_history)
-    ax.set_xlabel("??")
+    ax.set_xlabel("轮次")
     ax.set_ylabel("目标函数得分")
     ax.grid(True)
     ax.legend()
@@ -560,8 +667,13 @@ def run_once(ser, ctrl_key, mode, params, target_rpm):
     if not send_command_wait_ack(ser, cmd):
         raise RuntimeError("ACK failed")
     if mode == "hold":
-        print("Hold command ACK. Motor keeps running until STOP.")
-        return None, None
+        print("Hold command ACK. DSP will stop after the 4 s record and then return data...")
+        try:
+            return read_data(ser, record_length=HOLD_RECORD_LENGTH, timeout=HOLD_DATA_TIMEOUT)
+        except Exception:
+            print("Hold data timeout/error; sending STOP for safety...")
+            send_stop(ser)
+            raise
     if mode == "step":
         return read_data(ser, record_length=STEP_RECORD_LENGTH, timeout=STEP_DATA_TIMEOUT)
     return read_data(ser, record_length=RECORD_LENGTH, timeout=DATA_TIMEOUT)
@@ -573,9 +685,9 @@ def run_step(args):
     params = params_for_experiment(args.controller, args.params)
     out = BASE_DIR / ctrl["name"] / "step_0_100_200"
     with serial.Serial(args.port, BAUD_RATE, timeout=0.05) as ser:
-        speed, current = run_once(ser, args.controller, "step", params, 200.0)
+        speed, current, observer = run_once(ser, args.controller, "step", params, 200.0)
     stamp = time.strftime("%Y%m%d_%H%M%S")
-    csv_path, plot_path = save_step_run(out, f"{args.controller}_step_0_100_200_{stamp}", speed, current, args.controller)
+    csv_path, plot_path = save_step_run(out, f"{args.controller}_step_0_100_200_{stamp}", speed, current, args.controller, observer)
     print(f"Saved CSV: {csv_path}")
     print(f"Saved plot: {plot_path}")
     print(
@@ -585,13 +697,57 @@ def run_step(args):
     )
 
 
-def run_hold(args):
+def _old_run_hold_no_data(args):
     args.controller = normalize_controller(args.controller)
     ctrl = CONTROLLERS[args.controller]
     params = params_for_experiment(args.controller, args.params)
     with serial.Serial(args.port, BAUD_RATE, timeout=0.05) as ser:
         run_once(ser, args.controller, "hold", params, args.target)
     print(f"已进入 {args.target:g} rpm 保持运行，电机会持续转动；需要停止请运行 stop。")
+
+
+def run_hold(args):
+    args.controller = normalize_controller(args.controller)
+    ctrl = CONTROLLERS[args.controller]
+    params = params_for_experiment(args.controller, args.params)
+    with serial.Serial(args.port, BAUD_RATE, timeout=0.05) as ser:
+        speed, current, observer = run_once(ser, args.controller, "hold", params, args.target)
+        stop_ok = send_stop(ser)
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    out = BASE_DIR / ctrl["name"] / f"hold_{args.target:g}rpm"
+    csv_path, plot_path = save_bo_waveform(
+        out,
+        f"{args.controller}_hold_{args.target:g}rpm_{stamp}",
+        speed,
+        current,
+        args.controller,
+        target_rpm=args.target,
+        observer=observer,
+    )
+    print(f"Saved CSV: {csv_path}")
+    print(f"Saved plot: {plot_path}")
+    print("STOP", "ok" if stop_ok else "no response")
+    speed_abs = np.abs(speed)
+    current_abs = np.abs(current)
+    current_rms = float(np.sqrt(np.mean(current ** 2)))
+    tail = speed_abs[int(len(speed_abs) * 0.5):]
+    print(
+        f"Done. target={args.target:g} rpm, "
+        f"speed_mean={np.mean(speed_abs):.1f} rpm, "
+        f"tail_mean={np.mean(tail):.1f} rpm, "
+        f"tail_std={np.std(tail):.2f} rpm, "
+        f"Ipk={np.max(current_abs):.2f} A, "
+        f"Irms={current_rms:.2f} A"
+    )
+    if not args.no_show:
+        plot_waveform(
+            speed,
+            current,
+            args.controller,
+            target_rpm=args.target,
+            title=f"{args.controller} hold {args.target:g} rpm: speed and phase currents",
+        )
+        plt.show()
 
 
 def run_stop(args):
@@ -608,84 +764,125 @@ def run_bo(args):
     out = BASE_DIR / ctrl["name"] / "bo" / time.strftime("%Y%m%d_%H%M%S")
     out.mkdir(parents=True, exist_ok=True)
     log_path = out / "bo_log.csv"
-    best = {"score": float("inf"), "params": None, "speed": None, "current": None}
+    best = {"score": float("inf"), "params": None, "speed": None, "current": None, "observer": None}
     score_history = []
     best_score_history = []
     improved_history = []
-    space = [Real(a, b, name=n) for (a, b), n in zip(ctrl["space"], ctrl["param_names"])]
+    trial = 0
+    n_stages = max(1, args.stages)
+    calls_per_stage = max(5, args.calls // n_stages)
+    shrink_factors = [0.25, 0.15, 0.10, 0.06, 0.04, 0.03][:n_stages]
 
-    with log_path.open("w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow([
-            "trial", "status", "score", "rise_time", "settling_time", "overshoot",
-            "tail_mean", "tail_max", "osc_std", "osc_range", "osc_mean_error",
-            "osc_penalty", "current_peak", "current_rms", "current_penalty",
-            *ctrl["param_names"],
-        ])
+    log_header = [
+        "trial", "stage", "status", "score", "rise_time", "settling_time", "overshoot",
+        "tail_mean", "tail_max", "osc_std", "osc_range", "osc_mean_error",
+        "osc_penalty", "post_rise_std", "post_rise_range", "post_rise_penalty",
+        "current_peak", "current_rms", "current_penalty",
+        *ctrl["param_names"],
+    ]
+    append_csv_row_with_retry(log_path, log_header)
+
+    current_bounds = list(ctrl["space"])
+    cumulative_best_x = None
 
     with serial.Serial(args.port, BAUD_RATE, timeout=0.05) as ser:
-        trial = 0
-        def objective(params):
-            nonlocal trial
-            trial += 1
-            print(f"\n[Trial {trial}/{args.calls}] " + ", ".join(f"{n}:{v:.5g}" for n, v in zip(ctrl["param_names"], params)))
-            status = "ACK_FAIL"
-            metrics = {
-                "rise_time": 0.0, "settling_time": 0.0, "overshoot": 0.0,
-                "tail_mean": 0.0, "tail_max": 0.0, "osc_std": 0.0,
-                "osc_range": 0.0, "osc_mean_error": 0.0, "osc_penalty": 0.0,
-                "current_peak": 0.0, "current_rms": 0.0, "current_penalty": 0.0,
-            }
-            score = FAIL_SCORE
-            improved = False
-            try:
-                speed, current = run_once(ser, args.controller, "bo", params, TARGET_RPM)
-                score, metrics = calculate_score(speed, current)
-                status = "OK" if score < FAIL_SCORE else "LOW_SPEED"
-                print(
-                    f"Done. score={score:.1f}, rise={metrics['rise_time']:.3f}s, "
-                    f"settle={metrics['settling_time']:.3f}s, overshoot={metrics['overshoot']:.1f} rpm, "
-                    f"tail_mean={metrics['tail_mean']:.1f} rpm, Ipk={metrics['current_peak']:.2f}A, "
-                    f"Irms={metrics['current_rms']:.2f}A"
-                )
-                if score < best["score"]:
-                    best.update(score=score, params=command_params(ctrl, params), speed=speed.copy(), current=current.copy())
-                    improved = True
-                    save_bo_waveform(out, "best_params_waveform", speed, current, args.controller)
-                    save_best_params(out / "best_params.csv", ctrl, params, score)
-                    save_best_params(BEST_PARAM_DIR / f"{args.controller}_best_params.csv", ctrl, params, score)
-                    print(f"New best score: {score:.1f}")
-            except Exception as exc:
-                status = "FAIL"
-                print("Trial failed:", exc)
-            with log_path.open("a", newline="", encoding="utf-8") as f:
-                w = csv.writer(f)
-                w.writerow([
-                    trial, status, score, metrics["rise_time"], metrics["settling_time"],
+        for stage in range(1, n_stages + 1):
+            stage_best_score = best["score"]
+            stage_out = out / f"stage_{stage}"
+            stage_out.mkdir(parents=True, exist_ok=True)
+            initial_points = max(2, (calls_per_stage + 1) // 3)
+            print(f"\n{'='*50}")
+            print(f"Stage {stage}/{n_stages}  calls={calls_per_stage}  initial={initial_points}")
+            if cumulative_best_x is not None:
+                print(f"  shrink factor={shrink_factors[stage-1]:.3f}")
+                for (lo, hi), name in zip(current_bounds, ctrl["param_names"]):
+                    print(f"    {name}: [{lo:.4g}, {hi:.4g}]")
+
+            space = [Real(lo, hi, name=n) for (lo, hi), n in zip(current_bounds, ctrl["param_names"])]
+            stage_seed = args.seed + stage * 100
+
+            def objective(params):
+                nonlocal trial
+                trial += 1
+                print(f"\n[Trial {trial}] Stage {stage}  " + ", ".join(
+                    f"{n}:{v:.5g}" for n, v in zip(ctrl["param_names"], params)))
+                status = "ACK_FAIL"
+                metrics = {
+                    "rise_time": 0.0, "settling_time": 0.0, "overshoot": 0.0,
+                    "tail_mean": 0.0, "tail_max": 0.0, "osc_std": 0.0,
+                    "osc_range": 0.0, "osc_mean_error": 0.0, "osc_penalty": 0.0,
+                    "post_rise_std": 0.0, "post_rise_range": 0.0, "post_rise_penalty": 0.0,
+                    "current_peak": 0.0, "current_rms": 0.0, "current_penalty": 0.0,
+                }
+                score = FAIL_SCORE
+                improved = False
+                try:
+                    speed, current, observer = run_once(ser, args.controller, "bo", params, TARGET_RPM)
+                    score, metrics = calculate_score(speed, current)
+                    status = "OK" if score < FAIL_SCORE else "LOW_SPEED"
+                    print(
+                        f"Done. score={score:.1f}, rise={metrics['rise_time']:.3f}s, "
+                        f"settle={metrics['settling_time']:.3f}s, overshoot={metrics['overshoot']:.1f} rpm, "
+                        f"tail_mean={metrics['tail_mean']:.1f} rpm, post_range={metrics['post_rise_range']:.1f} rpm, "
+                        f"Ipk={metrics['current_peak']:.2f}A, Irms={metrics['current_rms']:.2f}A"
+                    )
+                    if score < best["score"]:
+                        best.update(score=score, params=command_params(ctrl, params),
+                                    speed=speed.copy(), current=current.copy(), observer=observer.copy())
+                        improved = True
+                        save_bo_waveform(out, "best_params_waveform", speed, current, args.controller, observer=observer)
+                        save_bo_waveform(stage_out, "best_params_waveform", speed, current, args.controller, observer=observer)
+                        save_best_params(out / "best_params.csv", ctrl, params, score)
+                        save_best_params(stage_out / "best_params.csv", ctrl, params, score)
+                        save_best_params(BEST_PARAM_DIR / f"{args.controller}_best_params.csv",
+                                         ctrl, params, score)
+                        print(f">>> New best overall: score={score:.1f}")
+                except Exception as exc:
+                    status = "FAIL"
+                    print("Trial failed:", exc)
+                append_csv_row_with_retry(log_path, [
+                    trial, stage, status, score, metrics["rise_time"], metrics["settling_time"],
                     metrics["overshoot"], metrics["tail_mean"], metrics["tail_max"],
                     metrics["osc_std"], metrics["osc_range"], metrics["osc_mean_error"],
-                    metrics["osc_penalty"], metrics["current_peak"], metrics["current_rms"],
+                    metrics["osc_penalty"], metrics["post_rise_std"], metrics["post_rise_range"],
+                    metrics["post_rise_penalty"], metrics["current_peak"], metrics["current_rms"],
                     metrics["current_penalty"], *params,
                 ])
-            score_history.append(score)
-            best_score_history.append(min(score_history))
-            improved_history.append(improved)
-            save_score_plot(log_path, out, improved_history)
-            print(f"Cooldown {args.cooldown:.0f}s")
-            cooldown_and_clear(ser, args.cooldown)
-            return score
+                score_history.append(score)
+                best_score_history.append(min(score_history))
+                improved_history.append(improved)
+                save_score_plot(log_path, out, improved_history)
+                print(f"Cooldown {args.cooldown:.0f}s")
+                cooldown_and_clear(ser, args.cooldown)
+                return score
 
-        res = gp_minimize(
-            objective,
-            space,
-            n_calls=args.calls,
-            n_initial_points=args.initial,
-            acq_func="EI",
-            random_state=args.seed,
-        )
+            res = gp_minimize(
+                objective,
+                space,
+                n_calls=calls_per_stage,
+                n_initial_points=initial_points,
+                acq_func="EI",
+                random_state=stage_seed,
+            )
+
+            if res.fun < stage_best_score:
+                cumulative_best_x = np.array(res.x)
+
+            if stage < n_stages:
+                factor = shrink_factors[stage - 1]
+                orig_bounds = ctrl["space"]
+                current_bounds = []
+                for i, ((lo, hi), name) in enumerate(zip(orig_bounds, ctrl["param_names"])):
+                    span = hi - lo
+                    new_lo = max(lo, cumulative_best_x[i] - span * factor)
+                    new_hi = min(hi, cumulative_best_x[i] + span * factor)
+                    current_bounds.append((new_lo, new_hi))
+                print(f"\nStage {stage} done -> shrinking for stage {stage+1} (factor={factor:.3f})")
+
     score_png = save_score_plot(log_path, out, improved_history)
-    print("Best score:", best["score"] if best["params"] is not None else res.fun)
-    print("Best params:", best["params"] or res.x)
+    print("\n" + "=" * 50)
+    print("Best score:", best["score"] if best["params"] is not None else "N/A")
+    print("Best params:", best["params"] or "N/A")
     if score_png:
         print("Score history plot saved to:", score_png)
     print("Best waveform plot saved to:", out / "best_params_waveform.png")
@@ -795,10 +992,12 @@ def main():
     p.add_argument("--port", default=DSP_PORT)
     p.add_argument("--target", type=float, default=None)
     p.add_argument("--params", help="手动指定参数，逗号分隔；不填则优先使用 BO 最优参数")
-    p.add_argument("--calls", type=int, default=40)
-    p.add_argument("--initial", type=int, default=15)
+    p.add_argument("--calls", type=int, default=40, help="BO total iterations across all stages (default: 40)")
+    p.add_argument("--stages", type=int, default=1, help="number of cascade stages (default: 1)")
+    p.add_argument("--initial", type=int, default=0, help="initial random points (0=auto per stage)")
     p.add_argument("--cooldown", type=float, default=COOLDOWN)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--no-show", action="store_true", help="保存数据和图片，但不弹出波形窗口")
     args = p.parse_args()
     args = fill_interactive_args(args)
 
@@ -817,3 +1016,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
