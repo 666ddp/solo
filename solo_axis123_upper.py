@@ -537,7 +537,7 @@ def save_step_run(out_dir, prefix, speed, current, label, observer=None):
         header=f"time_s,target_rpm,{label}_speed_rpm,d_hat_filtered",
         comments="",
     )
-    fig, (ax_speed, ax_current) = plt.subplots(2, 1, figsize=(12, 7), sharex=True)
+    fig, (ax_speed, ax_observer) = plt.subplots(2, 1, figsize=(12, 7), sharex=True)
     ax_speed.plot(t, speed, label=f"{label} speed")
     ax_speed.plot(t, ref, "r--", linewidth=1.5, label="target")
     ax_speed.axvline(STEP1_END_INDEX * DT, color="gray", linestyle=":", linewidth=1.0)
@@ -546,24 +546,22 @@ def save_step_run(out_dir, prefix, speed, current, label, observer=None):
     ax_speed.set_title(f"{label} 0-100-200 rpm step response")
     ax_speed.grid(True)
     ax_speed.legend()
-    ax_current.plot(t, current[:, 0], label="Ia")
-    ax_current.plot(t, current[:, 1], label="Ib")
-    ax_current.plot(t, current[:, 2], label="Ic")
-    ax_current.axhline(CURRENT_WARN_A, color="orange", linestyle="--", linewidth=1.0, label="current warn")
-    ax_current.axhline(-CURRENT_WARN_A, color="orange", linestyle="--", linewidth=1.0)
-    ax_current.set_xlabel("Time (s)")
-    ax_current.set_ylabel("Current (A)")
-    ax_current.grid(True)
-    ax_current.legend()
+    ax_observer.plot(t, observer, label="d_hat_filtered")
+    ax_observer.axhline(0.0, color="0.4", linestyle="--", linewidth=1.0)
+    ax_observer.set_xlabel("Time (s)")
+    ax_observer.set_ylabel("d_hat_filtered")
+    ax_observer.grid(True)
+    ax_observer.legend()
     fig.tight_layout()
     fig.savefig(plot_path, dpi=150)
     plt.close(fig)
     return csv_path, plot_path
 
 
-def plot_waveform(speed, current, label, target_rpm=TARGET_RPM, title=None):
+def plot_waveform(speed, current, label, target_rpm=TARGET_RPM, title=None, observer=None):
     t = np.arange(len(speed), dtype=float) * DT
-    fig, (ax_speed, ax_current) = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
+    observer = np.zeros(len(speed), dtype=float) if observer is None else np.asarray(observer, dtype=float)
+    fig, (ax_speed, ax_observer) = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
     ax_speed.plot(t, speed, label=f"{label} speed")
     ax_speed.axhline(target_rpm, color="r", linestyle="--", label="target")
     ax_speed.set_ylabel("Speed (rpm)")
@@ -571,13 +569,12 @@ def plot_waveform(speed, current, label, target_rpm=TARGET_RPM, title=None):
         ax_speed.set_title(title)
     ax_speed.grid(True)
     ax_speed.legend()
-    ax_current.plot(t, current[:, 0], label="Ia")
-    ax_current.plot(t, current[:, 1], label="Ib")
-    ax_current.plot(t, current[:, 2], label="Ic")
-    ax_current.set_xlabel("Time (s)")
-    ax_current.set_ylabel("Current (A)")
-    ax_current.grid(True)
-    ax_current.legend()
+    ax_observer.plot(t, observer, label="d_hat_filtered")
+    ax_observer.axhline(0.0, color="0.4", linestyle="--", linewidth=1.0)
+    ax_observer.set_xlabel("Time (s)")
+    ax_observer.set_ylabel("d_hat_filtered")
+    ax_observer.grid(True)
+    ax_observer.legend()
     fig.tight_layout()
     return fig
 
@@ -595,7 +592,7 @@ def save_bo_waveform(out_dir, prefix, speed, current, label, target_rpm=TARGET_R
         header=f"time_s,{label}_speed_rpm,d_hat_filtered",
         comments="",
     )
-    fig = plot_waveform(speed, current, label, target_rpm=target_rpm)
+    fig = plot_waveform(speed, current, label, target_rpm=target_rpm, observer=observer)
     fig.savefig(plot_path, dpi=150)
     plt.close(fig)
     return csv_path, plot_path
@@ -745,7 +742,8 @@ def run_hold(args):
             current,
             args.controller,
             target_rpm=args.target,
-            title=f"{args.controller} hold {args.target:g} rpm: speed and phase currents",
+            title=f"{args.controller} hold {args.target:g} rpm: speed and d_hat_filtered",
+            observer=observer,
         )
         plt.show()
 
